@@ -1,0 +1,23 @@
+# Virtual environment & Python caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
+
+# Benchmark downloads and diagnostic caches
+benchmark_cache/
+
+# Downloaded & generated media / timestamp logs
+*.mp3
+*.wav
+*.m4a
+*.mp4
+*.mkv
+*.webm
+*.opus
+*.ogg
+*.flac
+*timestamps*.json
