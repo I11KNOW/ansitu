@@ -9,9 +9,9 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .media import (
-    download_youtube_audio,
+    download_external_audio,
     extract_vad_audio,
-    is_youtube_url,
+    is_external_url,
     parse_timestamp,
     probe_media,
     require_ffmpeg,
@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         "input",
         help=(
             "Path to local audio/video file (.mp3, .wav, .m4a, .mp4, .mkv, .webm) "
-            "or a YouTube URL."
+            "or any external URL supported by yt-dlp (YouTube, SoundCloud, Archive.org, direct audio links)."
         ),
     )
     parser.add_argument(
@@ -96,23 +96,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-silence",
         type=int,
-        default=700,
+        default=None,
         metavar="MS",
-        help="Minimum silence duration in milliseconds required before splitting.",
+        help="Minimum silence duration in ms before splitting (auto-calibrated if omitted).",
     )
     parser.add_argument(
         "--crossfade",
         type=int,
-        default=20,
+        default=None,
         metavar="MS",
-        help="Equal-power audio crossfade duration at splice boundaries in milliseconds.",
+        help="Equal-power audio crossfade duration at splice boundaries in ms (auto if omitted).",
     )
     parser.add_argument(
         "--gap-ms",
         type=int,
-        default=450,
+        default=None,
         metavar="MS",
-        help="Low-level room-tone/silence breathing gap inserted between segments in milliseconds.",
+        help="Room-tone/silence breathing gap inserted between segments in ms (auto if omitted).",
     )
     parser.add_argument(
         "--strict-margin-db",
@@ -156,11 +156,11 @@ def _validate_args(args: argparse.Namespace) -> tuple[Optional[float], Optional[
         raise ValueError("--pad-start must be >= 0 ms.")
     if args.pad_end < 0:
         raise ValueError("--pad-end must be >= 0 ms.")
-    if args.min_silence < 0:
+    if args.min_silence is not None and args.min_silence < 0:
         raise ValueError("--min-silence must be >= 0 ms.")
-    if args.crossfade < 0:
+    if args.crossfade is not None and args.crossfade < 0:
         raise ValueError("--crossfade must be >= 0 ms.")
-    if args.gap_ms < 0:
+    if args.gap_ms is not None and args.gap_ms < 0:
         raise ValueError("--gap-ms must be >= 0 ms.")
     if args.strict_margin_db < 0:
         raise ValueError("--strict-margin-db must be >= 0 dB.")
@@ -193,7 +193,13 @@ def _print_summary(
         s_lbl = _format_duration(clip_start_s or 0.0).split(" (")[0]
         e_lbl = _format_duration(clip_end_s or vad_result.total_duration).split(" (")[0]
         print(f"Clip Range          : {s_lbl} -> {e_lbl}")
-    print(f"Breathing Gap       : {gap_ms} ms")
+    gap_kind = "room-tone bridge" if vad_result.use_room_tone else "digital silence"
+    print(
+        f"Adaptive Tuning     : min-silence {vad_result.resolved_min_silence_ms} ms, "
+        f"gap {gap_ms} ms ({gap_kind}), xfade {vad_result.resolved_crossfade_ms} ms"
+    )
+    if vad_result.stray_shouts_stripped > 0:
+        print(f"Stray Shouts        : {vad_result.stray_shouts_stripped} isolated background shouts stripped")
     if mode == "prayer":
         print(
             f"Prayer Transitions  : {vad_result.prayer_windows_count} Ruku/Sujud windows "
@@ -233,10 +239,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         start_s, end_s = _validate_args(args)
         require_ffmpeg()
 
-        if is_youtube_url(args.input):
+        if is_external_url(args.input):
             dl_dir = (args.output_dir or Path.cwd()).expanduser().resolve()
-            print(f"Downloading best audio from YouTube into: {dl_dir}")
-            input_path = download_youtube_audio(args.input, dl_dir)
+            print(f"Downloading best audio from URL into: {dl_dir}")
+            input_path = download_external_audio(args.input, dl_dir)
             print(f"Downloaded: {input_path.name}")
         else:
             input_path = validate_local_media(Path(args.input))
@@ -297,7 +303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         print(
             f"Slicing original stream ({len(vad_result.segments)} segments, "
-            f"{config.crossfade_ms}ms crossfade, {config.gap_ms}ms gap)..."
+            f"{vad_result.resolved_crossfade_ms}ms crossfade, {vad_result.resolved_gap_ms}ms gap)..."
         )
         result = render_clean_media(
             input_path=input_path,
@@ -312,7 +318,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _print_summary(
             result=result,
             mode=args.mode,
-            gap_ms=config.gap_ms,
+            gap_ms=vad_result.resolved_gap_ms,
             vad_result=vad_result,
             clip_start_s=start_s,
             clip_end_s=clip_end if end_s is not None else None,

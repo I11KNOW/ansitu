@@ -18,7 +18,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from quran_cleaner import cli
-from quran_cleaner.media import extract_vad_audio, is_youtube_url, parse_timestamp, probe_media
+from quran_cleaner.media import (
+    extract_vad_audio,
+    is_external_url,
+    is_youtube_url,
+    parse_timestamp,
+    probe_media,
+)
 from quran_cleaner.vad import VADConfig, detect_speech_segments
 
 CLI_SCRIPT = PROJECT_ROOT / "quran_trim.py"
@@ -241,10 +247,13 @@ class EndToEndPipelineTests(unittest.TestCase):
 
         data = json.loads(ts_json.read_text(encoding="utf-8"))
         self.assertEqual(data["mode"], "natural")
-        self.assertEqual(data["settings"]["gap_ms"], 450)
+        self.assertEqual(data["settings"]["min_silence_ms"], 900)
+        self.assertEqual(data["settings"]["crossfade_ms"], 65)
+        self.assertEqual(data["settings"]["gap_ms"], 500)
+        self.assertTrue(data["settings"]["room_tone_bridge"])
         # Should keep 3 segments: verse1, crowd shout, and verse2 (2a+350ms+2b bridged)
         self.assertEqual(data["summary"]["segments_kept"], 3)
-        expected_dur = sum(s["duration_s"] for s in data["segments"]) + 2 * 0.450
+        expected_dur = sum(s["duration_s"] for s in data["segments"]) + 2 * 0.500
         self.assertAlmostEqual(data["summary"]["final_duration_s"], expected_dur, places=2)
         self.assertGreater(data["summary"]["time_saved_pct"], 20.0)
 
@@ -262,14 +271,15 @@ class EndToEndPipelineTests(unittest.TestCase):
         )
         self.assertLess(diff, 2e-6)
 
-        # Verify 450ms room-tone breathing gap between segment 0 and segment 1 is smooth & low-level
+        # Verify 500ms room-tone breathing gap between segment 0 and segment 1 preserves floor ambience
         gap_start = int(round(seg0["duration_s"] * 48000))
-        gap_mid = clean_audio[gap_start + int(0.05 * 48000) : gap_start + int(0.40 * 48000), 0]
+        gap_mid = clean_audio[gap_start + int(0.08 * 48000) : gap_start + int(0.42 * 48000), 0]
         gap_rms_db = float(20.0 * np.log10(np.sqrt(np.mean(gap_mid * gap_mid) + 1e-12)))
+        self.assertGreater(gap_rms_db, -70.0)
         self.assertLess(gap_rms_db, -44.0)
 
         # Verify smooth splice transitions across both boundaries of the inserted gap
-        window = clean_audio[gap_start - 2000 : gap_start + int(0.45 * 48000) + 2000, 0]
+        window = clean_audio[gap_start - 2000 : gap_start + int(0.50 * 48000) + 2000, 0]
         max_step = float(np.max(np.abs(np.diff(window))))
         self.assertLess(max_step, 0.05)
 
@@ -475,6 +485,13 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertFalse(is_youtube_url("https://example.com/audio.mp3"))
         self.assertFalse(is_youtube_url(str(self.fixture_wav)))
 
+        self.assertTrue(is_external_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+        self.assertTrue(is_external_url("https://soundcloud.com/qari/surah-rahman"))
+        self.assertTrue(is_external_url("https://archive.org/download/quran/001.mp3"))
+        self.assertTrue(is_external_url("http://cdn.example.org/recitation.m4a"))
+        self.assertFalse(is_external_url(str(self.fixture_wav)))
+        self.assertFalse(is_external_url("ftp://example.com/file.mp3"))
+
         yt_dir = self.work_dir / "yt_mock"
         yt_dir.mkdir(exist_ok=True)
         fake_downloaded = yt_dir / "Sheikh Recitation [test123].m4a"
@@ -495,10 +512,10 @@ class EndToEndPipelineTests(unittest.TestCase):
             check=True,
         )
 
-        with patch("quran_cleaner.cli.download_youtube_audio", return_value=fake_downloaded) as mock_dl:
+        with patch("quran_cleaner.cli.download_external_audio", return_value=fake_downloaded) as mock_dl:
             rc = cli.main(
                 [
-                    "https://www.youtube.com/watch?v=test123",
+                    "https://archive.org/download/quran/test123.m4a",
                     "--mode",
                     "natural",
                     "--output-dir",
@@ -729,6 +746,245 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertIn("Datacenter IP", msg)
         self.assertIn("Upload Audio/Video File", msg)
 
+    def test_adaptive_room_tone_and_high_ambient_stray_shouts(self) -> None:
+        """Verify high-ambient adaptive params (1250/550/65), stray shout removal, and studio silence."""
+        sr = 48000
+        rng = np.random.default_rng(123)
+
+        def _add_vocal(buf: np.ndarray, start_s: float, dur_s: float, amp: float) -> None:
+            s_i = int(round(start_s * sr))
+            n = int(round(dur_s * sr))
+            t = np.arange(n, dtype=np.float64) / sr
+            mod = 0.65 + 0.35 * np.sin(2.0 * np.pi * 3.2 * t)
+            wave = (
+                0.55 * np.sin(2.0 * np.pi * 165.0 * t)
+                + 0.30 * np.sin(2.0 * np.pi * 330.0 * t)
+                + 0.15 * np.sin(2.0 * np.pi * 495.0 * t)
+            ) * mod
+            fade = min(int(0.03 * sr), n // 4)
+            wave[:fade] *= np.linspace(0.0, 1.0, fade)
+            wave[-fade:] *= np.linspace(1.0, 0.0, fade)
+            buf[s_i : s_i + n] += wave * amp
+
+        # 1. High-ambient vintage live WAV (-26 dBFS floor):
+        #    Verse 1 (0.5..4.5) + isolated stray shout (7.5..8.7 inside >=3s gaps)
+        #    + Verse 2 (11.7..15.7) + immediate crowd reaction (16.5..17.6, gap_before=0.8s < 1.5s)
+        total_live_s = 19.5
+        live_floor_amp = 10.0 ** (-26.0 / 20.0)
+        raw_noise = rng.normal(0.0, 1.0, int(total_live_s * sr) + 4)
+        live = 0.25 * raw_noise[:-4] + 0.50 * raw_noise[1:-3] + 0.25 * raw_noise[2:-2]
+        live *= live_floor_amp / float(np.sqrt(np.mean(live * live) + 1e-12))
+
+        rec_amp = 10.0 ** (-10.0 / 20.0)
+        shout_amp = 10.0 ** (-21.0 / 20.0)
+        _add_vocal(live, 0.5, 4.0, rec_amp)
+        _add_vocal(live, 7.5, 1.2, shout_amp)
+        _add_vocal(live, 11.7, 4.0, rec_amp)
+        _add_vocal(live, 16.5, 1.1, shout_amp)
+
+        live_wav = self.work_dir / "high_ambient_live.wav"
+        sf.write(str(live_wav), np.column_stack([live, live]), sr, subtype="PCM_16")
+        res = self._run_cli(str(live_wav))
+        self.assertEqual(res.returncode, 0, res.stderr + "\n" + res.stdout)
+
+        live_ts = json.loads((self.work_dir / "timestamps.json").read_text(encoding="utf-8"))
+        self.assertEqual(live_ts["profile"]["detected"], "vintage/live")
+        self.assertGreater(live_ts["profile"]["noise_floor_p5_db"], -30.0)
+        self.assertEqual(live_ts["settings"]["min_silence_ms"], 1250)
+        self.assertEqual(live_ts["settings"]["gap_ms"], 550)
+        self.assertEqual(live_ts["settings"]["crossfade_ms"], 65)
+        self.assertTrue(live_ts["settings"]["room_tone_bridge"])
+        self.assertEqual(live_ts["summary"]["stray_shouts_stripped"], 1)
+
+        kept_segs = live_ts["segments"]
+        # Stray shout around 8.1s must be absent; Verse 1 (~2.5s), Verse 2 + immediate reaction (~17.0s) kept
+        self.assertFalse(any(s["start_s"] <= 8.1 <= s["end_s"] for s in kept_segs))
+        self.assertTrue(any(s["start_s"] <= 2.5 <= s["end_s"] for s in kept_segs))
+        self.assertTrue(any(s["start_s"] <= 17.0 <= s["end_s"] for s in kept_segs))
+
+        # Check gap interior preserves continuous hall floor ambience (~ -26 dBFS, NOT zero digital silence)
+        clean_live, _ = sf.read(str(self.work_dir / "high_ambient_live_clean.wav"), dtype="float64", always_2d=True)
+        g_start = int(round(kept_segs[0]["duration_s"] * sr))
+        g_mid = clean_live[g_start + int(0.08 * sr) : g_start + int(0.47 * sr), 0]
+        g_rms_db = float(20.0 * np.log10(np.sqrt(np.mean(g_mid * g_mid) + 1e-12)))
+        self.assertGreater(g_rms_db, -36.0)
+        self.assertLess(g_rms_db, -20.0)
+
+        # 2. Studio recording (-64 dBFS floor): pure digital silence (700/450/20), no room-tone bridge
+        studio_dur_s = 11.0
+        studio_amp = 10.0 ** (-64.0 / 20.0)
+        studio = rng.normal(0.0, studio_amp, int(studio_dur_s * sr))
+        _add_vocal(studio, 0.5, 3.0, rec_amp)
+        _add_vocal(studio, 6.5, 3.0, rec_amp)
+
+        studio_wav = self.work_dir / "clean_studio.wav"
+        studio_out = self.work_dir / "clean_studio_out.wav"
+        studio_ts_p = self.work_dir / "studio_ts.json"
+        sf.write(str(studio_wav), np.column_stack([studio, studio]), sr, subtype="PCM_16")
+        res_s = self._run_cli(str(studio_wav), "-o", str(studio_out), "--timestamps", str(studio_ts_p))
+        self.assertEqual(res_s.returncode, 0, res_s.stderr + "\n" + res_s.stdout)
+
+        studio_ts = json.loads(studio_ts_p.read_text(encoding="utf-8"))
+        self.assertEqual(studio_ts["profile"]["detected"], "studio")
+        self.assertEqual(studio_ts["settings"]["min_silence_ms"], 700)
+        self.assertEqual(studio_ts["settings"]["gap_ms"], 450)
+        self.assertEqual(studio_ts["settings"]["crossfade_ms"], 20)
+        self.assertFalse(studio_ts["settings"]["room_tone_bridge"])
+
+        clean_studio, _ = sf.read(str(studio_out), dtype="float64", always_2d=True)
+        sg_start = int(round(studio_ts["segments"][0]["duration_s"] * sr))
+        sg_mid = clean_studio[sg_start + int(0.05 * sr) : sg_start + int(0.40 * sr), 0]
+        sg_rms_db = float(20.0 * np.log10(np.sqrt(np.mean(sg_mid * sg_mid) + 1e-12)))
+        self.assertLess(sg_rms_db, -90.0)
+
+    def test_multi_range_and_quality_presets(self) -> None:
+        """Verify multi-range seamless stitching and 128/256/Lossless WAV quality options."""
+        import app as web_app
+
+        self.assertTrue(web_app.is_lossless_source("recitation.wav"))
+        self.assertTrue(web_app.is_lossless_source("recitation.FLAC"))
+        self.assertFalse(web_app.is_lossless_source("recitation.mp3"))
+        self.assertIn("lossless_wav", web_app.quality_options_for_source("recitation.flac"))
+        self.assertNotIn("lossless_wav", web_app.quality_options_for_source("recitation.m4a"))
+
+        flac_path = self.work_dir / "source_lossless.flac"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(self.fixture_wav), "-c:a", "flac", str(flac_path)],
+            check=True,
+        )
+
+        # Multi-range Lossless WAV output from FLAC source
+        res_wav = web_app.run_cleaning_job(
+            mode="natural",
+            ranges=[("00:00", "00:05"), ("00:09", "00:14")],
+            out_format="m4a",
+            quality="lossless_wav",
+            uploaded_name="source_lossless.flac",
+            uploaded_bytes=flac_path.read_bytes(),
+        )
+        self.assertEqual(res_wav["output_filename"], "source_lossless_clean.wav")
+        self.assertEqual(res_wav["mime_type"], "audio/wav")
+        self.assertEqual(res_wav["ranges_count"], 2)
+        wav_probe_p = self.work_dir / "web_multi.wav"
+        wav_probe_p.write_bytes(res_wav["audio_bytes"])
+        wav_info = probe_media(wav_probe_p)
+        self.assertTrue(wav_info.audio_codec.startswith("pcm_"))
+        self.assertEqual(wav_info.sample_rate, 48000)
+        ts_multi = json.loads(res_wav["timestamps_json"])
+        self.assertEqual(len(ts_multi["ranges"]), 2)
+        self.assertGreaterEqual(res_wav["segments_kept"], 2)
+
+        # Multi-range 128 kbps M4A vs 256 kbps MP3
+        res_128 = web_app.run_cleaning_job(
+            mode="natural",
+            ranges=[("00:00", "00:05"), ("00:09", "00:14")],
+            out_format="m4a",
+            quality="128",
+            uploaded_name="source_lossless.flac",
+            uploaded_bytes=flac_path.read_bytes(),
+        )
+        m4a_p = self.work_dir / "web_multi_128.m4a"
+        m4a_p.write_bytes(res_128["audio_bytes"])
+        m4a_info = probe_media(m4a_p)
+        self.assertEqual(m4a_info.audio_codec, "aac")
+        self.assertIsNotNone(m4a_info.audio_bit_rate)
+        self.assertLess(m4a_info.audio_bit_rate, 180_000)
+
+        res_256 = web_app.run_cleaning_job(
+            mode="natural",
+            ranges=[("00:00", "00:05"), ("00:09", "00:14")],
+            out_format="mp3",
+            quality="256",
+            uploaded_name="source_lossless.flac",
+            uploaded_bytes=flac_path.read_bytes(),
+        )
+        mp3_p = self.work_dir / "web_multi_256.mp3"
+        mp3_p.write_bytes(res_256["audio_bytes"])
+        mp3_info = probe_media(mp3_p)
+        self.assertEqual(mp3_info.audio_codec, "mp3")
+        self.assertIsNotNone(mp3_info.audio_bit_rate)
+        self.assertGreaterEqual(mp3_info.audio_bit_rate, 240_000)
+
+    def test_surgical_acoustic_fixes_and_external_url_quality_guards(self) -> None:
+        """Verify low-SNR 2.5dB sustain, studio p90-26dB quiet passage, 10.8s prayer guard, and URL/WAV rules."""
+        import app as web_app
+
+        sr = 16000
+        rng = np.random.default_rng(77)
+
+        def _harm(dur_s: float, amp: float) -> np.ndarray:
+            n = int(round(dur_s * sr))
+            t = np.arange(n, dtype=np.float64) / float(sr)
+            sig = (
+                0.55 * np.sin(2.0 * np.pi * 175.0 * t)
+                + 0.30 * np.sin(2.0 * np.pi * 350.0 * t)
+                + 0.15 * np.sin(2.0 * np.pi * 525.0 * t)
+            )
+            return sig * (amp / float(np.sqrt(np.mean(sig * sig) + 1e-12)))
+
+        # 1. Low-SNR vintage sustain (spread ~11 dB): steady -10 dBFS head + 2.0s soft tail (~-15.6 dBFS)
+        low_snr = rng.normal(0.0, 10.0 ** (-21.0 / 20.0), int(11.0 * sr))
+        low_snr[int(1.0 * sr) : int(5.0 * sr)] += _harm(4.0, 10.0 ** (-10.0 / 20.0))
+        low_snr[int(5.0 * sr) : int(7.0 * sr)] += _harm(2.0, 10.0 ** (-15.6 / 20.0))
+        low_snr[int(7.5 * sr) : int(10.0 * sr)] += _harm(2.5, 10.0 ** (-10.0 / 20.0))
+        low_res = detect_speech_segments(low_snr.astype(np.float32), VADConfig(mode="natural"), exact_duration=11.0)
+        self.assertEqual(low_res.profile.kind, "vintage/live")
+        self.assertLess(low_res.profile.snr_db, 22.0)
+        # Soft -15.6 dBFS tail [5.0..7.0s] must remain preserved inside first segment
+        self.assertTrue(any(s.start <= 1.2 and s.end >= 6.8 for s in low_res.segments))
+
+        # 2. Studio soft passage (-33 dBFS vs -10 dBFS p90 -> p90-23, safely above p90-26)
+        studio = rng.normal(0.0, 10.0 ** (-72.0 / 20.0), int(12.0 * sr))
+        studio[int(1.0 * sr) : int(4.5 * sr)] += _harm(3.5, 10.0 ** (-10.0 / 20.0))
+        studio[int(6.2 * sr) : int(8.0 * sr)] += _harm(1.8, 10.0 ** (-33.0 / 20.0))
+        studio[int(9.0 * sr) : int(11.0 * sr)] += _harm(2.0, 10.0 ** (-10.0 / 20.0))
+        studio_res = detect_speech_segments(studio.astype(np.float32), VADConfig(mode="natural"), exact_duration=12.0)
+        self.assertEqual(studio_res.profile.kind, "studio")
+        self.assertTrue(any(s.start <= 6.5 and s.end >= 7.7 for s in studio_res.segments))
+
+        # 3. Muballigh 10.8s guard: 11.3s live bursts (<= 12s but > 10.8s) must NOT trigger prayer windows
+        qasas_like = _normalize_rms(rng.standard_normal(int(125.0 * sr)), -38.0)
+        spans = [(2.0, 32.0), (35.0, 46.3), (49.0, 60.3), (63.0, 74.3), (78.0, 118.0)]
+        for t0, t1 in spans:
+            s0, s1 = int(t0 * sr), int(t1 * sr)
+            qasas_like[s0:s1] += _harm(t1 - t0, 10.0 ** (-11.0 / 20.0))
+        q_res = detect_speech_segments(qasas_like.astype(np.float32), VADConfig(mode="prayer"), exact_duration=125.0)
+        self.assertEqual(q_res.prayer_windows_count, 0)
+        self.assertEqual(q_res.prayer_stripped_count, 0)
+
+        # 4. Web app Lossless WAV blocked for compressed uploads and external URLs, plus SoundCloud mock
+        with self.assertRaises(ValueError):
+            web_app.run_cleaning_job(
+                mode="natural",
+                out_format="m4a",
+                quality="lossless_wav",
+                uploaded_name="track.mp3",
+                uploaded_bytes=b"dummy",
+            )
+        with self.assertRaises(ValueError):
+            web_app.run_cleaning_job(
+                mode="natural",
+                out_format="m4a",
+                quality="lossless_wav",
+                external_url="https://soundcloud.com/qari/recitation",
+            )
+
+        m4a_dl = self.work_dir / "sc_mock.m4a"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(self.fixture_wav), "-c:a", "aac", "-b:a", "192k", str(m4a_dl)],
+            check=True,
+        )
+        with patch("app.download_youtube_audio", return_value=m4a_dl) as mock_dl:
+            res_sc = web_app.run_cleaning_job(
+                mode="natural",
+                out_format="m4a",
+                quality="192",
+                external_url="https://soundcloud.com/qari/surah-qaf",
+            )
+        mock_dl.assert_called_once()
+        self.assertEqual(res_sc["output_filename"], "sc_mock_clean.m4a")
+        self.assertEqual(res_sc["quality"], "192")
+
     def test_web_app_ui_smoke(self) -> None:
         from streamlit.testing.v1 import AppTest
 
@@ -737,8 +993,21 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertEqual(len(at.tabs), 2)
         self.assertEqual(len(at.radio), 2)
+        self.assertEqual(len(at.selectbox), 1)
+        self.assertEqual(at.selectbox[0].value, "192")
+        self.assertNotIn("lossless_wav", at.selectbox[0].options)
         self.assertEqual(len(at.text_input), 3)
-        self.assertEqual(len(at.button), 2)
+        self.assertEqual(len(at.button), 3)
+        self.assertIsNotNone(at.button(key="run_external_btn"))
+
+        # Click "+ Add Range" and confirm dynamic second range row + remove button appear cleanly
+        at.button(key="add_range_btn").click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.text_input), 5)
+        self.assertIsNotNone(at.button(key="del_range_1"))
+        at.button(key="del_range_1").click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.text_input), 3)
 
 
 if __name__ == "__main__":

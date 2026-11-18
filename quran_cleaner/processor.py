@@ -1,4 +1,4 @@
-"""Zero-quality-loss dual-rate media slicer, 20ms crossfade engine, breathing gaps, and export."""
+"""Zero-quality-loss dual-rate media slicer, adaptive crossfade engine, room-tone gaps, and export."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import soundfile as sf
@@ -226,6 +226,22 @@ def _feed_gap_segment(
     blender.end_segment(is_last_segment=False)
 
 
+def _synthetic_floor_buffer(
+    needed: int,
+    channels: int,
+    floor_db: float,
+) -> np.ndarray:
+    """Create a smooth low-passed ambient noise fallback matching the measured floor dBFS."""
+    target_db = min(-24.0, max(-52.0, floor_db))
+    target_rms = 10.0 ** (target_db / 20.0)
+    rng = np.random.default_rng(42)
+    raw = rng.normal(0.0, 1.0, size=(needed + 4, channels))
+    soft = 0.25 * raw[:-4] + 0.50 * raw[1:-3] + 0.25 * raw[2:-2]
+    soft -= np.mean(soft, axis=0, keepdims=True)
+    rms = float(np.sqrt(np.mean(soft * soft) + 1e-12))
+    return soft * (target_rms / rms)
+
+
 def _build_room_tone_buffer(
     input_path: Path,
     info: MediaInfo,
@@ -233,7 +249,7 @@ def _build_room_tone_buffer(
     gap_samples: int,
     fade_samples: int,
 ) -> Optional[np.ndarray]:
-    """Build a native-rate low-level room-tone (or silence) gap buffer of length gap+fade."""
+    """Build a native-rate room-tone bridge (vintage/live) or digital silence (studio)."""
     if gap_samples <= 0:
         return None
 
@@ -242,10 +258,14 @@ def _build_room_tone_buffer(
     channels = info.channels
     gap_window = vad_result.quietest_gap_window
 
-    if gap_window is None or gap_window[2] > -30.0:
+    # Studio recordings (floor <= -50 dBFS) use pure digital silence without hiss.
+    if not vad_result.use_room_tone or vad_result.profile.noise_floor_p5_db <= -50.0:
         return np.zeros((needed, channels), dtype=np.float64)
 
-    g_start, g_end, g_rms_db = gap_window
+    if gap_window is None:
+        return _synthetic_floor_buffer(needed, channels, vad_result.profile.noise_floor_p5_db)
+
+    g_start, g_end, _ = gap_window
     dur = max(0.20, g_end - g_start)
 
     try:
@@ -288,17 +308,18 @@ def _build_room_tone_buffer(
                 .astype(np.float64)
             )
     except Exception:
-        return np.zeros((needed, channels), dtype=np.float64)
+        return _synthetic_floor_buffer(needed, channels, vad_result.profile.noise_floor_p5_db)
 
     if grain.shape[0] < max(64, int(0.10 * sr)):
-        return np.zeros((needed, channels), dtype=np.float64)
+        return _synthetic_floor_buffer(needed, channels, vad_result.profile.noise_floor_p5_db)
 
-    # Strip DC offset and keep the gap genuinely low-level (<= -46 dBFS).
+    # Strip DC offset and anchor bridge gently near p5-p15 ambience (avoiding abrupt level jumps).
     grain = grain - np.mean(grain, axis=0, keepdims=True)
     grain_rms = float(np.sqrt(np.mean(grain * grain) + 1e-12))
     grain_db = float(20.0 * np.log10(grain_rms))
-    if grain_db > -46.0:
-        grain *= 10.0 ** ((-46.0 - grain_db) / 20.0)
+    floor_cap_db = min(-22.0, max(-48.0, vad_result.profile.noise_floor_p10_db + 1.0))
+    if grain_db > floor_cap_db:
+        grain *= 10.0 ** ((floor_cap_db - grain_db) / 20.0)
 
     if grain.shape[0] >= needed:
         return grain[:needed].copy()
@@ -328,6 +349,7 @@ def _build_sample_ranges(
     sample_rate: int,
     total_frames: Optional[int],
     fade_samples: int,
+    extend_last: bool = False,
 ) -> list[tuple[int, int]]:
     """Convert time segments to sample intervals with tail extension for exact crossfade duration."""
     ranges: list[tuple[int, int]] = []
@@ -335,10 +357,11 @@ def _build_sample_ranges(
     for idx, seg in enumerate(segments):
         s_frame = max(0, int(round(seg.start * sample_rate)))
         e_frame = max(s_frame + 1, int(round(seg.end * sample_rate)))
-        if idx < last_idx and fade_samples > 0:
+        if (idx < last_idx or extend_last) and fade_samples > 0:
             e_frame += fade_samples
-            next_start = max(0, int(round(segments[idx + 1].start * sample_rate)))
-            e_frame = min(e_frame, next_start)
+            if idx < last_idx:
+                next_start = max(0, int(round(segments[idx + 1].start * sample_rate)))
+                e_frame = min(e_frame, next_start)
         if total_frames is not None:
             e_frame = min(e_frame, total_frames)
         if e_frame > s_frame:
@@ -346,17 +369,68 @@ def _build_sample_ranges(
     return ranges
 
 
+def _build_range_stream_items(
+    input_path: Path,
+    info: MediaInfo,
+    range_results: Sequence[VADResult],
+    total_frames: Optional[int],
+    crossfade_ms: int,
+) -> list[tuple[int, int, Optional[np.ndarray], bool]]:
+    """Flatten one or more VADResult groups into (start_frame, end_frame, gap_buffer, is_last)."""
+    sr = info.sample_rate
+    fade_samples = max(0, int(round((crossfade_ms / 1000.0) * sr)))
+    per_range: list[tuple[list[tuple[int, int]], Optional[np.ndarray]]] = []
+
+    last_range_idx = len(range_results) - 1
+    for r_idx, vr in enumerate(range_results):
+        is_last_range = r_idx == last_range_idx
+        s_ranges = _build_sample_ranges(
+            vr.segments,
+            sr,
+            total_frames,
+            fade_samples,
+            extend_last=not is_last_range,
+        )
+        if not s_ranges:
+            continue
+        gap_samples = max(0, int(round((vr.resolved_gap_ms / 1000.0) * sr)))
+        needs_gap = gap_samples > 0 and (len(s_ranges) > 1 or not is_last_range)
+        gap_buf = (
+            _build_room_tone_buffer(
+                input_path=input_path,
+                info=info,
+                vad_result=vr,
+                gap_samples=gap_samples,
+                fade_samples=fade_samples,
+            )
+            if needs_gap
+            else None
+        )
+        per_range.append((s_ranges, gap_buf))
+
+    if not per_range:
+        return []
+
+    flat: list[tuple[int, int, Optional[np.ndarray], bool]] = []
+    last_group_idx = len(per_range) - 1
+    for g_idx, (s_ranges, gap_buf) in enumerate(per_range):
+        is_last_group = g_idx == last_group_idx
+        last_seg_idx = len(s_ranges) - 1
+        for s_idx, (s_f, e_f) in enumerate(s_ranges):
+            is_last_overall = is_last_group and (s_idx == last_seg_idx)
+            flat.append((s_f, e_f, None if is_last_overall else gap_buf, is_last_overall))
+    return flat
+
+
 def _process_wav_soundfile(
     input_path: Path,
     output_path: Path,
-    segments: list[Segment],
+    range_results: Sequence[VADResult],
     info: MediaInfo,
-    vad_result: VADResult,
     crossfade_ms: int,
-    gap_ms: int,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> float:
-    """Slice and crossfade a WAV file directly using soundfile without re-encoding."""
+    """Slice and crossfade one or more WAV segment groups via soundfile without re-encoding."""
     with sf.SoundFile(str(input_path), mode="r") as sf_in:
         sr = sf_in.samplerate
         channels = sf_in.channels
@@ -366,22 +440,18 @@ def _process_wav_soundfile(
             subtype = "PCM_24" if sf.check_format(fmt, "PCM_24") else "PCM_16"
         total_frames = sf_in.frames
 
-        fade_samples = max(0, int(round((crossfade_ms / 1000.0) * sr)))
-        gap_samples = max(0, int(round((gap_ms / 1000.0) * sr))) if len(segments) > 1 else 0
-        ranges = _build_sample_ranges(segments, sr, total_frames, fade_samples)
-        if not ranges:
-            raise RuntimeError("No valid audio sample ranges remained after slicing.")
-
-        gap_buffer = _build_room_tone_buffer(
+        items = _build_range_stream_items(
             input_path=input_path,
             info=info,
-            vad_result=vad_result,
-            gap_samples=gap_samples,
-            fade_samples=fade_samples,
+            range_results=range_results,
+            total_frames=total_frames,
+            crossfade_ms=crossfade_ms,
         )
+        if not items:
+            raise RuntimeError("No valid audio sample ranges remained after slicing.")
 
-        fade_start = ranges[0][0] > 0
-        fade_end = ranges[-1][1] < total_frames
+        fade_start = items[0][0] > 0
+        fade_end = items[-1][1] < total_frames
 
         with sf.SoundFile(
             str(output_path),
@@ -403,11 +473,10 @@ def _process_wav_soundfile(
                 fade_end_edge=fade_end,
             )
 
-            last_idx = len(ranges) - 1
-            for idx, (s_frame, e_frame) in enumerate(ranges):
+            total_items = float(len(items))
+            for idx, (s_frame, e_frame, gap_buffer, is_last) in enumerate(items):
                 sf_in.seek(s_frame)
                 remaining = e_frame - s_frame
-                is_last = idx == last_idx
                 while remaining > 0:
                     to_read = min(_DECODE_CHUNK_FRAMES, remaining)
                     data = sf_in.read(to_read, dtype="float64", always_2d=True)
@@ -419,23 +488,34 @@ def _process_wav_soundfile(
                 if not is_last:
                     _feed_gap_segment(blender, gap_buffer)
                 if progress_cb is not None:
-                    progress_cb(min(1.0, (idx + 1) / float(len(ranges))))
+                    progress_cb(min(1.0, (idx + 1) / total_items))
 
             return blender.frames_written / float(sr)
 
 
-def _audio_codec_args(ext: str, info: MediaInfo) -> list[str]:
-    """Select transparent FFmpeg encoder settings preserving original quality."""
+def _audio_codec_args(
+    ext: str,
+    info: MediaInfo,
+    bitrate_kbps: Optional[int] = None,
+) -> list[str]:
+    """Select transparent FFmpeg encoder settings preserving or targeting requested quality."""
     ext = ext.lower()
     orig_br = info.audio_bit_rate
 
+    if ext == ".wav":
+        return ["-c:a", "pcm_s24le"]
+
     if ext == ".mp3":
+        if bitrate_kbps is not None:
+            return ["-c:a", "libmp3lame", "-b:a", str(int(bitrate_kbps) * 1000)]
         if orig_br and orig_br > 0:
             target = min(320_000, max(orig_br, 192_000))
             return ["-c:a", "libmp3lame", "-b:a", str(target)]
         return ["-c:a", "libmp3lame", "-q:a", "0"]
 
     if ext in {".m4a", ".mp4"}:
+        if bitrate_kbps is not None:
+            return ["-c:a", "aac", "-b:a", str(int(bitrate_kbps) * 1000)]
         target = min(320_000, max(orig_br or 256_000, 192_000))
         return ["-c:a", "aac", "-b:a", str(target)]
 
@@ -473,42 +553,34 @@ def _read_stderr_file(err_file: tempfile.TemporaryFile) -> str:
     return err_file.read().decode("utf-8", errors="replace").strip()
 
 
-def _stream_audio_slice_encode(
+def _partition_monotonic_items(
+    items: list[tuple[int, int, Optional[np.ndarray], bool]],
+) -> list[list[tuple[int, int, Optional[np.ndarray], bool]]]:
+    """Split sample-range items into maximal non-overlapping increasing decode runs."""
+    if not items:
+        return []
+    runs: list[list[tuple[int, int, Optional[np.ndarray], bool]]] = [[items[0]]]
+    for item in items[1:]:
+        if item[0] >= runs[-1][-1][1]:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return runs
+
+
+def _decode_run_into_blender(
+    ffmpeg_bin: str,
     input_path: Path,
-    segments: list[Segment],
-    info: MediaInfo,
-    vad_result: VADResult,
-    crossfade_ms: int,
-    gap_samples: int,
-    encoder_cmd_tail: list[str],
-    output_path: Path,
+    sr: int,
+    channels: int,
+    run_items: list[tuple[int, int, Optional[np.ndarray], bool]],
+    blender: CrossfadeSegmentStream,
     progress_cb: Optional[Callable[[float], None]] = None,
-) -> float:
-    """Decode original audio in one pass, slice + crossfade + gap in numpy, pipe to encoder."""
-    ffmpeg_bin, _ = require_ffmpeg()
-    sr = info.sample_rate
-    channels = info.channels
-    fade_samples = max(0, int(round((crossfade_ms / 1000.0) * sr)))
-    est_total_frames = int(round(info.duration * sr))
-    ranges = _build_sample_ranges(segments, sr, est_total_frames, fade_samples)
-    if not ranges:
-        raise RuntimeError("No valid audio ranges remained after slicing.")
-
-    gap_buffer = (
-        _build_room_tone_buffer(
-            input_path=input_path,
-            info=info,
-            vad_result=vad_result,
-            gap_samples=gap_samples,
-            fade_samples=fade_samples,
-        )
-        if len(ranges) > 1 and gap_samples > 0
-        else None
-    )
-
-    fade_start = ranges[0][0] > 0
-    fade_end = ranges[-1][1] < max(0, est_total_frames - int(0.05 * sr))
-
+    progress_offset: float = 0.0,
+    progress_span: float = 1.0,
+) -> None:
+    """Decode original audio once up to run end and feed all slices in run_items to blender."""
+    max_end_frame = max(item[1] for item in run_items)
     dec_cmd = [
         ffmpeg_bin,
         "-v",
@@ -516,7 +588,7 @@ def _stream_audio_slice_encode(
         "-i",
         str(input_path),
         "-to",
-        f"{(ranges[-1][1] / float(sr)) + 0.25:.4f}",
+        f"{(max_end_frame / float(sr)) + 0.25:.4f}",
         "-vn",
         "-c:a",
         "pcm_f32le",
@@ -528,6 +600,108 @@ def _stream_audio_slice_encode(
         "f32le",
         "pipe:1",
     ]
+    with tempfile.TemporaryFile() as dec_err:
+        dec = subprocess.Popen(
+            dec_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=dec_err,
+        )
+        assert dec.stdout is not None
+
+        frame_bytes = channels * 4
+        chunk_bytes = _DECODE_CHUNK_FRAMES * frame_bytes
+        pos = 0
+        seg_idx = 0
+        active_seg_idx: Optional[int] = None
+        total_target_frames = max(1, max_end_frame)
+        last_pct_step = -1
+
+        try:
+            while True:
+                raw = dec.stdout.read(chunk_bytes)
+                if not raw:
+                    break
+                n_frames = len(raw) // frame_bytes
+                if n_frames == 0:
+                    continue
+                arr = np.frombuffer(raw, dtype="<f4", count=n_frames * channels).reshape(
+                    n_frames, channels
+                )
+                chunk_start = pos
+                chunk_end = pos + n_frames
+
+                while seg_idx < len(run_items):
+                    s_f, e_f, gap_buffer, is_last = run_items[seg_idx]
+                    if e_f <= chunk_start:
+                        if active_seg_idx == seg_idx:
+                            blender.end_segment(is_last_segment=is_last)
+                            if not is_last:
+                                _feed_gap_segment(blender, gap_buffer)
+                            active_seg_idx = None
+                        seg_idx += 1
+                        continue
+                    if s_f >= chunk_end:
+                        break
+
+                    active_seg_idx = seg_idx
+                    local_s = max(0, s_f - chunk_start)
+                    local_e = min(n_frames, e_f - chunk_start)
+                    blender.feed(
+                        arr[local_s:local_e].astype(np.float64, copy=False),
+                        is_last_segment=is_last,
+                    )
+                    if e_f <= chunk_end:
+                        blender.end_segment(is_last_segment=is_last)
+                        if not is_last:
+                            _feed_gap_segment(blender, gap_buffer)
+                        active_seg_idx = None
+                        seg_idx += 1
+                    else:
+                        break
+
+                pos = chunk_end
+                if progress_cb is not None:
+                    local_frac = min(1.0, pos / float(total_target_frames))
+                    pct_step = int(local_frac * 40)
+                    if pct_step > last_pct_step:
+                        last_pct_step = pct_step
+                        progress_cb(min(1.0, progress_offset + progress_span * local_frac))
+
+            if active_seg_idx is not None:
+                _, _, gap_buffer, is_last = run_items[active_seg_idx]
+                blender.end_segment(is_last_segment=is_last)
+                if not is_last:
+                    _feed_gap_segment(blender, gap_buffer)
+
+            dec.stdout.close()
+        except Exception:
+            dec.kill()
+            dec.wait()
+            raise
+
+        dec_rc = dec.wait()
+        if dec_rc != 0:
+            raise RuntimeError(f"FFmpeg decode failed: {_read_stderr_file(dec_err)}")
+
+
+def _encode_stream_items(
+    input_path: Path,
+    items: list[tuple[int, int, Optional[np.ndarray], bool]],
+    info: MediaInfo,
+    crossfade_ms: int,
+    encoder_cmd_tail: list[str],
+    output_path: Path,
+    est_total_frames: int,
+    progress_cb: Optional[Callable[[float], None]] = None,
+) -> float:
+    """Decode one or more monotonic sample runs, crossfade + bridge in numpy, pipe once to encoder."""
+    ffmpeg_bin, _ = require_ffmpeg()
+    sr = info.sample_rate
+    channels = info.channels
+    fade_start = items[0][0] > 0
+    fade_end = items[-1][1] < max(0, est_total_frames - int(0.05 * sr))
+
     enc_cmd = [
         ffmpeg_bin,
         "-y",
@@ -545,20 +719,17 @@ def _stream_audio_slice_encode(
         str(output_path),
     ]
 
-    with tempfile.TemporaryFile() as dec_err, tempfile.TemporaryFile() as enc_err:
-        dec = subprocess.Popen(
-            dec_cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=dec_err,
-        )
+    runs = _partition_monotonic_items(items)
+    total_run_frames = float(max(1, sum(run[-1][1] for run in runs)))
+
+    with tempfile.TemporaryFile() as enc_err:
         enc = subprocess.Popen(
             enc_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=enc_err,
         )
-        assert dec.stdout is not None and enc.stdin is not None
+        assert enc.stdin is not None
 
         def _write_pcm(arr: np.ndarray) -> None:
             enc.stdin.write(np.ascontiguousarray(arr, dtype="<f4").tobytes())
@@ -572,87 +743,31 @@ def _stream_audio_slice_encode(
             fade_end_edge=fade_end,
         )
 
-        frame_bytes = channels * 4
-        chunk_bytes = _DECODE_CHUNK_FRAMES * frame_bytes
-        pos = 0
-        seg_idx = 0
-        last_idx = len(ranges) - 1
-        active_seg_idx: Optional[int] = None
-        total_target_frames = max(1, ranges[-1][1])
-        last_pct_step = -1
-
         try:
-            while True:
-                raw = dec.stdout.read(chunk_bytes)
-                if not raw:
-                    break
-                n_frames = len(raw) // frame_bytes
-                if n_frames == 0:
-                    continue
-                arr = np.frombuffer(raw, dtype="<f4", count=n_frames * channels).reshape(
-                    n_frames, channels
+            covered_frames = 0
+            for run in runs:
+                run_end = run[-1][1]
+                span = run_end / total_run_frames
+                offset = covered_frames / total_run_frames
+                _decode_run_into_blender(
+                    ffmpeg_bin=ffmpeg_bin,
+                    input_path=input_path,
+                    sr=sr,
+                    channels=channels,
+                    run_items=run,
+                    blender=blender,
+                    progress_cb=progress_cb,
+                    progress_offset=offset,
+                    progress_span=span,
                 )
-                chunk_start = pos
-                chunk_end = pos + n_frames
-
-                while seg_idx < len(ranges):
-                    s_f, e_f = ranges[seg_idx]
-                    if e_f <= chunk_start:
-                        if active_seg_idx == seg_idx:
-                            is_last = seg_idx == last_idx
-                            blender.end_segment(is_last_segment=is_last)
-                            if not is_last:
-                                _feed_gap_segment(blender, gap_buffer)
-                            active_seg_idx = None
-                        seg_idx += 1
-                        continue
-                    if s_f >= chunk_end:
-                        break
-
-                    active_seg_idx = seg_idx
-                    local_s = max(0, s_f - chunk_start)
-                    local_e = min(n_frames, e_f - chunk_start)
-                    is_last = seg_idx == last_idx
-                    blender.feed(
-                        arr[local_s:local_e].astype(np.float64, copy=False),
-                        is_last_segment=is_last,
-                    )
-                    if e_f <= chunk_end:
-                        blender.end_segment(is_last_segment=is_last)
-                        if not is_last:
-                            _feed_gap_segment(blender, gap_buffer)
-                        active_seg_idx = None
-                        seg_idx += 1
-                    else:
-                        break
-
-                pos = chunk_end
-                if progress_cb is not None:
-                    frac = min(1.0, pos / float(total_target_frames))
-                    pct_step = int(frac * 40)
-                    if pct_step > last_pct_step:
-                        last_pct_step = pct_step
-                        progress_cb(frac)
-
-            if active_seg_idx is not None:
-                is_last = active_seg_idx == last_idx
-                blender.end_segment(is_last_segment=is_last)
-                if not is_last:
-                    _feed_gap_segment(blender, gap_buffer)
-
-            dec.stdout.close()
+                covered_frames += run_end
             enc.stdin.close()
         except Exception:
-            dec.kill()
             enc.kill()
-            dec.wait()
             enc.wait()
             raise
 
-        dec_rc = dec.wait()
         enc_rc = enc.wait()
-        if dec_rc != 0:
-            raise RuntimeError(f"FFmpeg decode failed: {_read_stderr_file(dec_err)}")
         if enc_rc != 0:
             raise RuntimeError(f"FFmpeg encode failed: {_read_stderr_file(enc_err)}")
 
@@ -662,16 +777,25 @@ def _stream_audio_slice_encode(
 def _process_compressed_audio(
     input_path: Path,
     output_path: Path,
-    segments: list[Segment],
+    range_results: Sequence[VADResult],
     info: MediaInfo,
-    vad_result: VADResult,
     crossfade_ms: int,
-    gap_ms: int,
+    bitrate_kbps: Optional[int] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> float:
     """Process compressed audio (.mp3, .m4a, .webm, etc.) preserving sample rate and tags."""
     ext = output_path.suffix.lower()
-    codec_args = _audio_codec_args(ext, info)
+    codec_args = _audio_codec_args(ext, info, bitrate_kbps=bitrate_kbps)
+    est_total_frames = int(round(info.duration * info.sample_rate))
+    items = _build_range_stream_items(
+        input_path=input_path,
+        info=info,
+        range_results=range_results,
+        total_frames=est_total_frames,
+        crossfade_ms=crossfade_ms,
+    )
+    if not items:
+        raise RuntimeError("No valid audio ranges remained after slicing.")
 
     extra_args: list[str] = [
         "-i",
@@ -688,17 +812,15 @@ def _process_compressed_audio(
     if ext == ".m4a":
         extra_args.extend(["-movflags", "+faststart"])
 
-    gap_samples = max(0, int(round((gap_ms / 1000.0) * info.sample_rate)))
     encoder_tail = [*extra_args, *codec_args]
-    return _stream_audio_slice_encode(
+    return _encode_stream_items(
         input_path=input_path,
-        segments=segments,
+        items=items,
         info=info,
-        vad_result=vad_result,
         crossfade_ms=crossfade_ms,
-        gap_samples=gap_samples,
         encoder_cmd_tail=encoder_tail,
         output_path=output_path,
+        est_total_frames=est_total_frames,
         progress_cb=progress_cb,
     )
 
@@ -774,6 +896,7 @@ def _process_video(
     vad_result: VADResult,
     crossfade_ms: int,
     gap_ms: int,
+    bitrate_kbps: Optional[int] = None,
 ) -> tuple[float, list[Segment]]:
     """Slice video via frame-exact yuv4mpegpipe stream, hold gap frames, mux crossfaded audio."""
     ffmpeg_bin, _ = require_ffmpeg()
@@ -923,7 +1046,7 @@ def _process_video(
         if not actual_segments:
             raise RuntimeError("No video frames remained after slicing.")
 
-        audio_codec_args = _audio_codec_args(ext, info)
+        audio_codec_args = _audio_codec_args(ext, info, bitrate_kbps=bitrate_kbps)
         mux_tail = [
             "-i",
             str(temp_video),
@@ -942,15 +1065,39 @@ def _process_video(
         if ext == ".mp4":
             mux_tail.extend(["-movflags", "+faststart"])
 
-        final_duration = _stream_audio_slice_encode(
+        est_total_frames = int(round(info.duration * info.sample_rate))
+        fade_samples = max(0, int(round((crossfade_ms / 1000.0) * info.sample_rate)))
+        s_ranges = _build_sample_ranges(
+            actual_segments, info.sample_rate, est_total_frames, fade_samples
+        )
+        if not s_ranges:
+            raise RuntimeError("No valid audio ranges remained after video slicing.")
+
+        gap_buffer = (
+            _build_room_tone_buffer(
+                input_path=input_path,
+                info=info,
+                vad_result=vad_result,
+                gap_samples=gap_samples,
+                fade_samples=fade_samples,
+            )
+            if len(s_ranges) > 1 and gap_samples > 0
+            else None
+        )
+        last_seg = len(s_ranges) - 1
+        video_items = [
+            (s_f, e_f, None if idx == last_seg else gap_buffer, idx == last_seg)
+            for idx, (s_f, e_f) in enumerate(s_ranges)
+        ]
+
+        final_duration = _encode_stream_items(
             input_path=input_path,
-            segments=actual_segments,
+            items=video_items,
             info=info,
-            vad_result=vad_result,
             crossfade_ms=crossfade_ms,
-            gap_samples=gap_samples,
             encoder_cmd_tail=mux_tail,
             output_path=output_path,
+            est_total_frames=est_total_frames,
         )
 
         rounded_segments = [
@@ -976,11 +1123,32 @@ def write_timestamps_json(
     source_duration: float,
     clip_start_s: Optional[float] = None,
     clip_end_s: Optional[float] = None,
+    original_duration: Optional[float] = None,
+    prayer_windows_detected: Optional[int] = None,
+    prayer_segments_stripped: Optional[int] = None,
+    stray_shouts_stripped: Optional[int] = None,
+    bitrate_kbps: Optional[int] = None,
+    range_summaries: Optional[list[dict[str, object]]] = None,
 ) -> None:
     """Write a structured JSON log of all kept segments, profile info, and stats."""
-    original = vad_result.total_duration
+    original = original_duration if original_duration is not None else vad_result.total_duration
     saved_s = max(0.0, original - final_duration)
     saved_pct = (saved_s / original * 100.0) if original > 0 else 0.0
+    p_wins = (
+        prayer_windows_detected
+        if prayer_windows_detected is not None
+        else vad_result.prayer_windows_count
+    )
+    p_stripped = (
+        prayer_segments_stripped
+        if prayer_segments_stripped is not None
+        else vad_result.prayer_stripped_count
+    )
+    s_stripped = (
+        stray_shouts_stripped
+        if stray_shouts_stripped is not None
+        else vad_result.stray_shouts_stripped
+    )
 
     payload: dict[str, object] = {
         "input_file": str(input_path),
@@ -997,9 +1165,11 @@ def write_timestamps_json(
             "threshold": config.threshold,
             "pad_start_ms": config.pad_start_ms,
             "pad_end_ms": config.pad_end_ms,
-            "min_silence_ms": config.min_silence_ms,
-            "crossfade_ms": config.crossfade_ms,
-            "gap_ms": config.gap_ms,
+            "min_silence_ms": vad_result.resolved_min_silence_ms,
+            "crossfade_ms": vad_result.resolved_crossfade_ms,
+            "gap_ms": vad_result.resolved_gap_ms,
+            "room_tone_bridge": vad_result.use_room_tone,
+            "bitrate_kbps": bitrate_kbps,
             "strict_margin_db": config.strict_margin_db if config.mode == "strict" else None,
             "clip_start_s": round(clip_start_s, 4) if clip_start_s is not None else None,
             "clip_end_s": round(clip_end_s, 4) if clip_end_s is not None else None,
@@ -1011,8 +1181,9 @@ def write_timestamps_json(
             "time_saved_s": round(saved_s, 4),
             "time_saved_pct": round(saved_pct, 2),
             "segments_kept": len(final_segments),
-            "prayer_windows_detected": vad_result.prayer_windows_count,
-            "prayer_segments_stripped": vad_result.prayer_stripped_count,
+            "prayer_windows_detected": p_wins,
+            "prayer_segments_stripped": p_stripped,
+            "stray_shouts_stripped": s_stripped,
         },
         "segments": [
             {
@@ -1028,6 +1199,8 @@ def write_timestamps_json(
             for i, seg in enumerate(final_segments)
         ],
     }
+    if range_summaries is not None:
+        payload["ranges"] = range_summaries
     if config.mode == "strict":
         payload["calibration"] = {
             "speech_p25_db": vad_result.speech_p25_db,
@@ -1053,8 +1226,9 @@ def render_clean_media(
     clip_start_s: Optional[float] = None,
     clip_end_s: Optional[float] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
+    bitrate_kbps: Optional[int] = None,
 ) -> ProcessResult:
-    """Slice and concatenate the original stream at native quality with 20ms crossfades."""
+    """Slice and concatenate the original stream at native quality with adaptive crossfades."""
     if not vad_result.segments:
         raise RuntimeError(
             "No speech segments were detected above the configured thresholds. "
@@ -1067,6 +1241,8 @@ def render_clean_media(
     tmp_output = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
     final_segments = vad_result.segments
     out_ext = output_path.suffix.lower()
+    eff_crossfade_ms = vad_result.resolved_crossfade_ms
+    eff_gap_ms = vad_result.resolved_gap_ms
 
     try:
         if info.has_video and out_ext not in _AUDIO_ONLY_EXTENSIONS:
@@ -1076,8 +1252,9 @@ def render_clean_media(
                 segments=vad_result.segments,
                 info=info,
                 vad_result=vad_result,
-                crossfade_ms=config.crossfade_ms,
-                gap_ms=config.gap_ms,
+                crossfade_ms=eff_crossfade_ms,
+                gap_ms=eff_gap_ms,
+                bitrate_kbps=bitrate_kbps,
             )
             if progress_cb is not None:
                 progress_cb(1.0)
@@ -1085,22 +1262,19 @@ def render_clean_media(
             final_duration = _process_wav_soundfile(
                 input_path=input_path,
                 output_path=tmp_output,
-                segments=vad_result.segments,
+                range_results=[vad_result],
                 info=info,
-                vad_result=vad_result,
-                crossfade_ms=config.crossfade_ms,
-                gap_ms=config.gap_ms,
+                crossfade_ms=eff_crossfade_ms,
                 progress_cb=progress_cb,
             )
         else:
             final_duration = _process_compressed_audio(
                 input_path=input_path,
                 output_path=tmp_output,
-                segments=vad_result.segments,
+                range_results=[vad_result],
                 info=info,
-                vad_result=vad_result,
-                crossfade_ms=config.crossfade_ms,
-                gap_ms=config.gap_ms,
+                crossfade_ms=eff_crossfade_ms,
+                bitrate_kbps=bitrate_kbps,
                 progress_cb=progress_cb,
             )
 
@@ -1121,10 +1295,133 @@ def render_clean_media(
         source_duration=info.duration,
         clip_start_s=clip_start_s,
         clip_end_s=clip_end_s,
+        bitrate_kbps=bitrate_kbps,
     )
 
     original = vad_result.total_duration
     saved_pct = max(0.0, (original - final_duration) / original * 100.0) if original > 0 else 0.0
+
+    return ProcessResult(
+        input_path=input_path,
+        output_path=output_path,
+        timestamps_path=timestamps_path,
+        original_duration=original,
+        final_duration=final_duration,
+        time_saved_pct=saved_pct,
+        segments_kept=len(final_segments),
+        segments=final_segments,
+    )
+
+
+def render_clean_ranges(
+    input_path: Path,
+    output_path: Path,
+    timestamps_path: Path,
+    info: MediaInfo,
+    config: VADConfig,
+    range_jobs: Sequence[tuple[Optional[float], Optional[float], VADResult]],
+    progress_cb: Optional[Callable[[float], None]] = None,
+    bitrate_kbps: Optional[int] = None,
+) -> ProcessResult:
+    """Clean one or more selected time ranges and stitch them seamlessly into a single file."""
+    if not range_jobs:
+        raise ValueError("At least one time range is required.")
+
+    if len(range_jobs) == 1:
+        clip_start_s, clip_end_s, vr = range_jobs[0]
+        return render_clean_media(
+            input_path=input_path,
+            output_path=output_path,
+            timestamps_path=timestamps_path,
+            info=info,
+            config=config,
+            vad_result=vr,
+            clip_start_s=clip_start_s,
+            clip_end_s=clip_end_s,
+            progress_cb=progress_cb,
+            bitrate_kbps=bitrate_kbps,
+        )
+
+    for idx, (_, _, vr) in enumerate(range_jobs, start=1):
+        if not vr.segments:
+            raise RuntimeError(
+                f"Range #{idx} had no speech segments detected above the configured thresholds."
+            )
+
+    out_ext = output_path.suffix.lower()
+    if out_ext not in _AUDIO_ONLY_EXTENSIONS:
+        raise ValueError("Multi-range stitching currently supports audio outputs (.m4a, .mp3, .wav).")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamps_path.parent.mkdir(parents=True, exist_ok=True)
+
+    range_results = [vr for _, _, vr in range_jobs]
+    eff_crossfade_ms = max(vr.resolved_crossfade_ms for vr in range_results)
+    tmp_output = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
+
+    try:
+        if input_path.suffix.lower() == ".wav" and out_ext == ".wav":
+            final_duration = _process_wav_soundfile(
+                input_path=input_path,
+                output_path=tmp_output,
+                range_results=range_results,
+                info=info,
+                crossfade_ms=eff_crossfade_ms,
+                progress_cb=progress_cb,
+            )
+        else:
+            final_duration = _process_compressed_audio(
+                input_path=input_path,
+                output_path=tmp_output,
+                range_results=range_results,
+                info=info,
+                crossfade_ms=eff_crossfade_ms,
+                bitrate_kbps=bitrate_kbps,
+                progress_cb=progress_cb,
+            )
+
+        os.replace(tmp_output, output_path)
+    except Exception:
+        if tmp_output.exists():
+            tmp_output.unlink(missing_ok=True)
+        raise
+
+    final_segments = [seg for vr in range_results for seg in vr.segments]
+    original = sum(vr.total_duration for vr in range_results)
+    saved_pct = max(0.0, (original - final_duration) / original * 100.0) if original > 0 else 0.0
+
+    range_summaries: list[dict[str, object]] = [
+        {
+            "index": i + 1,
+            "start_s": round(s, 4) if s is not None else 0.0,
+            "end_s": round(e, 4) if e is not None else round(info.duration, 4),
+            "duration_s": round(vr.total_duration, 4),
+            "segments_kept": len(vr.segments),
+            "gap_ms": vr.resolved_gap_ms,
+            "crossfade_ms": vr.resolved_crossfade_ms,
+            "min_silence_ms": vr.resolved_min_silence_ms,
+            "room_tone_bridge": vr.use_room_tone,
+        }
+        for i, (s, e, vr) in enumerate(range_jobs)
+    ]
+
+    vad_ref = range_results[0]
+    write_timestamps_json(
+        timestamps_path=timestamps_path,
+        input_path=input_path,
+        output_path=output_path,
+        config=config,
+        vad_result=vad_ref,
+        final_segments=final_segments,
+        final_duration=final_duration,
+        source_duration=info.duration,
+        original_duration=original,
+        prayer_windows_detected=sum(vr.prayer_windows_count for vr in range_results),
+        prayer_segments_stripped=sum(vr.prayer_stripped_count for vr in range_results),
+        stray_shouts_stripped=sum(vr.stray_shouts_stripped for vr in range_results),
+        bitrate_kbps=bitrate_kbps,
+        range_summaries=range_summaries,
+    )
 
     return ProcessResult(
         input_path=input_path,

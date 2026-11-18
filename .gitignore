@@ -7,8 +7,9 @@ __pycache__/
 # Streamlit local secrets
 .streamlit/secrets.toml
 
-# Benchmark downloads and diagnostic caches
+# Benchmark downloads, local test corpora, and diagnostic caches
 benchmark_cache/
+new/
 
 # Downloaded & generated media / timestamp logs
 *.mp3

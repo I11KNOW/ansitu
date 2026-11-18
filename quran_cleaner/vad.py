@@ -28,9 +28,9 @@ class VADConfig:
     threshold: float = 0.20
     pad_start_ms: int = 200
     pad_end_ms: int = 300
-    min_silence_ms: int = 700
-    crossfade_ms: int = 20
-    gap_ms: int = 450
+    min_silence_ms: Optional[int] = None
+    crossfade_ms: Optional[int] = None
+    gap_ms: Optional[int] = None
     strict_margin_db: float = 12.0
 
 
@@ -74,6 +74,11 @@ class VADResult:
     prayer_windows_count: int = 0
     prayer_stripped_count: int = 0
     quietest_gap_window: Optional[tuple[float, float, float]] = None
+    resolved_min_silence_ms: int = 700
+    resolved_crossfade_ms: int = 20
+    resolved_gap_ms: int = 450
+    use_room_tone: bool = False
+    stray_shouts_stripped: int = 0
 
 
 def _segment_frame_dbs(
@@ -280,11 +285,11 @@ def _detect_energy_islands(
 
     if is_studio:
         # On clean studio recordings, run strictly as a high-level melodic-sustain
-        # safety net above breaths so Maqam holds are never clipped while breaths stay rejected.
+        # safety net above breaths so Maqam holds & quiet passages stay intact.
         if spread < 15.0:
             return []
-        onset_db = max(profile.noise_floor_p5_db + 22.0, profile.p90_db - 20.0)
-        sustain_db = onset_db - 4.0
+        onset_db = max(profile.noise_floor_p5_db + 16.0, profile.p90_db - 26.0)
+        sustain_db = max(profile.noise_floor_p5_db + 12.0, onset_db - 4.0)
         min_island_dur = 0.40
     else:
         if spread < 6.0:
@@ -293,9 +298,9 @@ def _detect_energy_islands(
             onset_db = max(profile.noise_floor_p10_db + 15.0, profile.p90_db - 25.0)
             sustain_db = onset_db - 4.0
         else:
-            # Moderate/low-SNR hall or crowd ambiance: crisp threshold avoids bridging mosque echoes.
+            # Moderate/low-SNR hall ambiance: stay >= 2.5 dB below onset so soft endings hold.
             onset_db = max(profile.noise_floor_p10_db + 0.52 * spread, profile.p90_db - 25.0)
-            sustain_db = onset_db - min(2.0, 0.15 * spread)
+            sustain_db = onset_db - max(2.5, min(3.5, 0.18 * spread))
         min_island_dur = 0.35
 
     raw_islands: list[tuple[int, int]] = []
@@ -418,6 +423,56 @@ def _filter_unconfirmed_noise_blips(
     return kept
 
 
+def _resolve_profile_params(
+    profile: AudioProfile,
+    config: VADConfig,
+) -> tuple[int, int, int, bool, bool]:
+    """Derive adaptive min_silence_ms, gap_ms, crossfade_ms, room-tone, and crowd mode."""
+    is_studio = profile.kind == "studio"
+    is_high_ambient = (not is_studio) and (
+        profile.noise_floor_p5_db > -30.0 or profile.snr_db < 18.0
+    )
+
+    if is_studio or profile.noise_floor_p5_db <= -50.0:
+        auto_min_sil, auto_gap, auto_xfade, use_room_tone = 700, 450, 20, False
+    elif is_high_ambient:
+        auto_min_sil, auto_gap, auto_xfade, use_room_tone = 1250, 550, 65, True
+    else:
+        auto_min_sil, auto_gap, auto_xfade, use_room_tone = 900, 500, 65, True
+
+    eff_min_sil = config.min_silence_ms if config.min_silence_ms is not None else auto_min_sil
+    eff_gap = config.gap_ms if config.gap_ms is not None else auto_gap
+    eff_xfade = config.crossfade_ms if config.crossfade_ms is not None else auto_xfade
+    return eff_min_sil, eff_gap, eff_xfade, use_room_tone, is_high_ambient
+
+
+def _filter_stray_isolated_shouts(
+    segs_s: list[tuple[float, float, float]],
+    clip_start_s: float,
+    clip_end_s: float,
+) -> tuple[list[tuple[float, float, float]], int]:
+    """Strip short low-energy isolated shouts floating in >=2s silences on noisy live tapes."""
+    if len(segs_s) < 3:
+        return segs_s, 0
+
+    ov_vals = np.array([x[2] for x in segs_s], dtype=np.float64)
+    durs = np.array([max(0.05, x[1] - x[0]) for x in segs_s], dtype=np.float64)
+    w_med = _weighted_percentile(ov_vals, durs, 50.0)
+
+    kept: list[tuple[float, float, float]] = []
+    stripped = 0
+    last_idx = len(segs_s) - 1
+    for idx, (s_s, e_s, rms_db) in enumerate(segs_s):
+        dur_s = e_s - s_s
+        gap_before = (s_s - clip_start_s) if idx == 0 else (s_s - segs_s[idx - 1][1])
+        gap_after = (clip_end_s - e_s) if idx == last_idx else (segs_s[idx + 1][0] - e_s)
+        if dur_s < 2.5 and rms_db <= (w_med - 4.5) and gap_before >= 2.0 and gap_after >= 2.0:
+            stripped += 1
+            continue
+        kept.append((s_s, e_s, rms_db))
+    return kept, stripped
+
+
 def _find_prayer_takbir_indices(
     segs_s: list[tuple[float, float, float]],
     sil_250_s: list[tuple[float, float]],
@@ -538,13 +593,13 @@ def _find_prayer_takbir_indices(
         max_utt_dur = max(segs_s[m][1] - segs_s[m][0] for m in cands)
 
         # Rule A: Muballigh Ruku/Sujud cluster between two long Rak'ah blocks (>= 25s,
-        # or closing partial Rak'ah > 12.5s at end of file): 14s-65s span of >= 3 utterances all <= 12.0s.
+        # or closing partial Rak'ah > 12.5s at end of file): 14s-65s span of >= 3 utterances all <= 10.8s.
         is_muballigh_cluster = (
             prev_dur >= 25.0
             and (next_dur >= 25.0 or (is_last_partial and next_dur > 12.5))
             and 14.0 <= w_dur <= 65.0
             and len(cands) >= 3
-            and max_utt_dur <= 12.0
+            and max_utt_dur <= 10.8
             and loud_utts >= 3
         )
         if is_muballigh_cluster:
@@ -593,8 +648,10 @@ def _find_quietest_gap_window(
     clip_start_s: float,
     clip_end_s: float,
     target_duration_s: float = 0.6,
+    profile: Optional[AudioProfile] = None,
+    frame_dbs: Optional[np.ndarray] = None,
 ) -> Optional[tuple[float, float, float]]:
-    """Locate the cleanest, lowest-RMS skipped silence window for authentic room tone."""
+    """Sample a clean ambient loop window from the recording's quietest floor frames (p5-p15)."""
     clip_dur = clip_end_s - clip_start_s
     if not kept_segments or clip_dur <= 0.3:
         return None
@@ -608,11 +665,27 @@ def _find_quietest_gap_window(
     if clip_end_s - cursor >= 0.25:
         gaps.append((cursor, clip_end_s))
 
-    if not gaps:
-        return None
+    floor_lo: Optional[float] = None
+    floor_hi: Optional[float] = None
+    if profile is not None:
+        if frame_dbs is None:
+            frame_dbs = _compute_frame_dbs(analysis_audio)
+        non_zero = frame_dbs[frame_dbs > -85.0]
+        p15 = float(np.percentile(non_zero, 15)) if non_zero.size > 0 else profile.noise_floor_p10_db
+        floor_lo = profile.noise_floor_p5_db - 3.0
+        floor_hi = max(profile.noise_floor_p10_db + 3.0, p15 + 2.0)
 
     win_samples = max(int(0.25 * VAD_SAMPLE_RATE), int(round(target_duration_s * VAD_SAMPLE_RATE)))
-    best: Optional[tuple[float, float, float]] = None
+    best_any: Optional[tuple[float, float, float]] = None
+    best_floor: Optional[tuple[float, float, float]] = None
+
+    def _consider(cand: tuple[float, float, float]) -> None:
+        nonlocal best_any, best_floor
+        if best_any is None or cand[2] < best_any[2]:
+            best_any = cand
+        if floor_lo is not None and floor_hi is not None and floor_lo <= cand[2] <= floor_hi:
+            if best_floor is None or cand[2] < best_floor[2]:
+                best_floor = cand
 
     for g_start, g_end in gaps:
         inner_s = g_start + 0.10 if (g_end - g_start) > 0.5 else g_start
@@ -625,25 +698,40 @@ def _find_quietest_gap_window(
         span = analysis_audio[s_idx:e_idx]
         if span.size <= win_samples:
             rms_db = float(20.0 * np.log10(np.sqrt(np.mean(span * span) + 1e-12)))
-            cand = (
-                clip_start_s + s_idx / float(VAD_SAMPLE_RATE),
-                clip_start_s + e_idx / float(VAD_SAMPLE_RATE),
-                rms_db,
+            _consider(
+                (
+                    clip_start_s + s_idx / float(VAD_SAMPLE_RATE),
+                    clip_start_s + e_idx / float(VAD_SAMPLE_RATE),
+                    rms_db,
+                )
             )
-            if best is None or cand[2] < best[2]:
-                best = cand
             continue
 
         step = max(1600, win_samples // 4)
         for off in range(0, span.size - win_samples + 1, step):
             w = span[off : off + win_samples]
             rms_db = float(20.0 * np.log10(np.sqrt(np.mean(w * w) + 1e-12)))
-            if best is None or rms_db < best[2]:
-                w_start = clip_start_s + (s_idx + off) / float(VAD_SAMPLE_RATE)
-                w_end = clip_start_s + (s_idx + off + win_samples) / float(VAD_SAMPLE_RATE)
-                best = (w_start, w_end, rms_db)
+            w_start = clip_start_s + (s_idx + off) / float(VAD_SAMPLE_RATE)
+            w_end = clip_start_s + (s_idx + off + win_samples) / float(VAD_SAMPLE_RATE)
+            _consider((w_start, w_end, rms_db))
 
-    return best
+    # Fallback: if no skipped gap lay in the p5-p15 floor band, scan contiguous frame_dbs.
+    if best_floor is None and floor_lo is not None and floor_hi is not None:
+        if frame_dbs is None:
+            frame_dbs = _compute_frame_dbs(analysis_audio)
+        win_frames = max(8, int(round(win_samples / float(_FRAME_SAMPLES))))
+        if frame_dbs.size >= win_frames:
+            step_f = max(4, win_frames // 2)
+            for f0 in range(0, frame_dbs.size - win_frames + 1, step_f):
+                slice_dbs = frame_dbs[f0 : f0 + win_frames]
+                mean_db = float(np.mean(slice_dbs))
+                if floor_lo <= mean_db <= floor_hi and float(np.max(slice_dbs)) <= floor_hi + 3.0:
+                    w_start = clip_start_s + (f0 * _FRAME_SAMPLES) / float(VAD_SAMPLE_RATE)
+                    w_end = clip_start_s + ((f0 + win_frames) * _FRAME_SAMPLES) / float(VAD_SAMPLE_RATE)
+                    if best_floor is None or mean_db < best_floor[2]:
+                        best_floor = (w_start, w_end, mean_db)
+
+    return best_floor or best_any
 
 
 def detect_speech_segments(
@@ -662,10 +750,13 @@ def detect_speech_segments(
     frame_dbs = _compute_frame_dbs(analysis_audio)
     profile = _profile_audio(analysis_audio, frame_dbs=frame_dbs)
 
+    eff_min_sil, eff_gap, eff_xfade, use_room_tone, is_high_ambient = _resolve_profile_params(
+        profile, config
+    )
     island_bridge_ms = (
-        min(_ENERGY_BRIDGE_MS, config.min_silence_ms)
+        min(_ENERGY_BRIDGE_MS, eff_min_sil)
         if config.mode == "strict"
-        else config.min_silence_ms
+        else eff_min_sil
     )
     min_speech_ms = _STUDIO_MIN_SPEECH_MS if profile.kind == "studio" else _MIN_SPEECH_MS
 
@@ -691,6 +782,22 @@ def detect_speech_segments(
                 p90_db=profile.p90_db,
                 snr_db=profile.snr_db,
             )
+            eff_min_sil, eff_gap, eff_xfade, use_room_tone, is_high_ambient = _resolve_profile_params(
+                profile, config
+            )
+            min_speech_ms = _STUDIO_MIN_SPEECH_MS
+            island_bridge_ms = (
+                min(_ENERGY_BRIDGE_MS, eff_min_sil)
+                if config.mode == "strict"
+                else eff_min_sil
+            )
+            if config.min_silence_ms is None:
+                silero_intervals = _run_silero_vad_chunked(
+                    audio_16k=audio_16k,
+                    threshold=config.threshold,
+                    island_bridge_ms=island_bridge_ms,
+                    min_speech_ms=min_speech_ms,
+                )
 
     energy_intervals = _detect_energy_islands(
         analysis_audio=analysis_audio,
@@ -707,9 +814,10 @@ def detect_speech_segments(
 
     if profile.kind == "studio":
         raw_samples = _filter_studio_breaths(analysis_audio, raw_samples)
-    raw_samples = _filter_unconfirmed_noise_blips(
-        analysis_audio, raw_samples, silero_intervals
-    )
+    else:
+        raw_samples = _filter_unconfirmed_noise_blips(
+            analysis_audio, raw_samples, silero_intervals
+        )
 
     if not raw_samples:
         return VADResult(
@@ -721,6 +829,10 @@ def detect_speech_segments(
             strict_cutoff_db=None,
             raw_segments_count=0,
             filtered_segments_count=0,
+            resolved_min_silence_ms=eff_min_sil,
+            resolved_crossfade_ms=eff_xfade,
+            resolved_gap_ms=eff_gap,
+            use_room_tone=use_room_tone,
         )
 
     speech_p25_db: Optional[float] = None
@@ -729,12 +841,13 @@ def detect_speech_segments(
     raw_count = len(raw_samples)
     prayer_windows_count = 0
     prayer_stripped_count = 0
+    stray_stripped_count = 0
 
     if config.mode == "strict":
         island_stats: list[tuple[int, int, float, float]] = []
         for s_idx, e_idx in raw_samples:
-            frame_dbs, overall_db = _segment_frame_dbs(analysis_audio, s_idx, e_idx)
-            island_energy_db = float(max(overall_db, float(np.median(frame_dbs))))
+            seg_fdbs, overall_db = _segment_frame_dbs(analysis_audio, s_idx, e_idx)
+            island_energy_db = float(max(overall_db, float(np.median(seg_fdbs))))
             island_stats.append((s_idx, e_idx, overall_db, island_energy_db))
 
         energies = np.array([x[3] for x in island_stats], dtype=np.float64)
@@ -757,7 +870,7 @@ def detect_speech_segments(
             if island_energy_db >= strict_cutoff_db
         ]
         filtered_count = len(kept_islands)
-        bridged = _bridge_close_segments(kept_islands, config.min_silence_ms / 1000.0)
+        bridged = _bridge_close_segments(kept_islands, eff_min_sil / 1000.0)
     else:
         segs_with_rms: list[tuple[float, float, float]] = []
         for s_idx, e_idx in raw_samples:
@@ -768,6 +881,13 @@ def detect_speech_segments(
                     clip_start_s + e_idx / float(VAD_SAMPLE_RATE),
                     overall_db,
                 )
+            )
+
+        if is_high_ambient:
+            segs_with_rms, stray_stripped_count = _filter_stray_isolated_shouts(
+                segs_with_rms,
+                clip_start_s=clip_start_s,
+                clip_end_s=clip_end_s,
             )
 
         # Compute unbridged 250ms Silero bursts for Prayer Ruku/Sujud & Auto-Detection Hint.
@@ -814,15 +934,15 @@ def detect_speech_segments(
         pad_end_s=config.pad_end_ms / 1000.0,
         min_bound=clip_start_s,
         max_bound=clip_end_s,
-        min_splice_gap_s=config.crossfade_ms / 1000.0,
+        min_splice_gap_s=eff_xfade / 1000.0,
     )
 
     final_segments: list[Segment] = []
     for seg in padded:
         s_idx = max(0, min(audio_16k.size, int(round((seg.start - clip_start_s) * VAD_SAMPLE_RATE))))
         e_idx = max(s_idx, min(audio_16k.size, int(round((seg.end - clip_start_s) * VAD_SAMPLE_RATE))))
-        frame_dbs, overall_db = _segment_frame_dbs(analysis_audio, s_idx, e_idx)
-        core_db = float(np.percentile(frame_dbs, 75))
+        seg_fdbs, overall_db = _segment_frame_dbs(analysis_audio, s_idx, e_idx)
+        core_db = float(np.percentile(seg_fdbs, 75))
         final_segments.append(
             Segment(
                 start=round(seg.start, 4),
@@ -832,12 +952,18 @@ def detect_speech_segments(
             )
         )
 
-    quiet_gap = _find_quietest_gap_window(
-        analysis_audio=analysis_audio,
-        kept_segments=final_segments,
-        clip_start_s=clip_start_s,
-        clip_end_s=clip_end_s,
-        target_duration_s=max(0.5, (config.gap_ms + config.crossfade_ms) / 1000.0),
+    quiet_gap = (
+        _find_quietest_gap_window(
+            analysis_audio=analysis_audio,
+            kept_segments=final_segments,
+            clip_start_s=clip_start_s,
+            clip_end_s=clip_end_s,
+            target_duration_s=max(0.5, (eff_gap + eff_xfade) / 1000.0),
+            profile=profile,
+            frame_dbs=frame_dbs,
+        )
+        if use_room_tone
+        else None
     )
 
     return VADResult(
@@ -856,4 +982,9 @@ def detect_speech_segments(
         prayer_windows_count=prayer_windows_count,
         prayer_stripped_count=prayer_stripped_count,
         quietest_gap_window=quiet_gap,
+        resolved_min_silence_ms=eff_min_sil,
+        resolved_crossfade_ms=eff_xfade,
+        resolved_gap_ms=eff_gap,
+        use_room_tone=use_room_tone,
+        stray_shouts_stripped=stray_stripped_count,
     )

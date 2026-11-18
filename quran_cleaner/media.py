@@ -1,4 +1,4 @@
-"""Media discovery, YouTube downloading, FFprobe inspection, and 16kHz VAD extraction."""
+"""Media discovery, external URL downloading (yt-dlp), FFprobe inspection, and 16kHz VAD extraction."""
 
 from __future__ import annotations
 
@@ -61,11 +61,20 @@ def require_ffmpeg() -> tuple[str, str]:
     return ffmpeg_bin, ffprobe_bin
 
 
+def is_external_url(source: str) -> bool:
+    """Return True if the input string is a valid http:// or https:// external media URL."""
+    stripped = source.strip()
+    if not stripped or any(ch.isspace() for ch in stripped):
+        return False
+    parsed = urlparse(stripped)
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc.strip())
+
+
 def is_youtube_url(source: str) -> bool:
     """Return True if the input string looks like a YouTube URL."""
-    parsed = urlparse(source.strip())
-    if parsed.scheme not in {"http", "https"}:
+    if not is_external_url(source):
         return False
+    parsed = urlparse(source.strip())
     host = parsed.netloc.lower().split(":")[0]
     return host in _YOUTUBE_HOSTS
 
@@ -84,13 +93,13 @@ def validate_local_media(path: Path) -> Path:
     return resolved
 
 
-def download_youtube_audio(url: str, output_dir: Path) -> Path:
-    """Download the best native audio stream from a YouTube URL via yt-dlp."""
+def download_external_audio(url: str, output_dir: Path) -> Path:
+    """Download the best native audio stream from any supported URL via yt-dlp."""
     try:
         import yt_dlp
     except ImportError as exc:
         raise RuntimeError(
-            "yt-dlp is required to download YouTube URLs. Install it via requirements.txt."
+            "yt-dlp is required to download external URLs. Install it via requirements.txt."
         ) from exc
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -117,6 +126,9 @@ def download_youtube_audio(url: str, output_dir: Path) -> Path:
     if not downloaded.is_file():
         raise RuntimeError(f"Downloaded audio file could not be found: {downloaded}")
     return downloaded.resolve()
+
+
+download_youtube_audio = download_external_audio
 
 
 def _parse_int(value: object) -> Optional[int]:

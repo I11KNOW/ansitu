@@ -1,48 +1,51 @@
-# Quran Recitation Silence & Gap Remover (`quran-trim`)
+# أنصتوا — Ansitu (`quran-trim`)
 
-A fast, modular Python CLI and bilingual (Arabic / English) Streamlit web app to automatically remove long silences, breaths, and prayer transitions from Quran recitation audio and video files — specifically engineered for vintage live recordings to preserve analog tape warmth, room character, and full dynamic range.
+A fast, modular Python CLI and bilingual (Arabic-first RTL / English) Streamlit web app to automatically remove long silences, breaths, and prayer transitions from Quran recitation audio and video files — engineered for vintage live recordings to preserve analog tape warmth, room ambience, and full dynamic range without dynamic compression or denoising.
 
 ## Features & Architecture
 
-- **Dual-Rate Zero-Loss Pipeline**: Decodes a temporary 16kHz mono stream (with an 80Hz high-pass filter for analysis only) for hybrid Silero VAD + vocal-band energy detection, then maps those exact timestamps back to slice and concatenate the **original high-sample-rate audio/video stream** (`soundfile` for `.wav -> .wav`, streaming FFmpeg for `.mp3`, `.m4a`, `.mp4`, `.mkv`, `.webm`, `.opus`, `.flac`).
-- **Auto-Profiler**: Automatically distinguishes clean studio recordings (filtering close-mic inhalation breaths via high-frequency spectral balance and `>= 220ms` duration gating) from vintage/reverberant live recordings (keeping the SNR-aware energy gate active while rejecting short unconfirmed low-energy cough/thump noise blips so soft verse endings and Madd stay intact).
-- **Untouched Dynamics**: Never applies denoising, EQ, loudness normalization, or dynamic range compression to the output stream.
-- **Smooth Transitions & Breathing Room**: Applies asymmetric padding (`--pad-start 200`, `--pad-end 300` to protect Ghunnah and soft verse endings), a `20ms` equal-power crossfade at every splice point, and a clean `--gap-ms` (`450ms` default) room-tone breathing gap between stitched segments.
-- **Modes & Clipping**:
-  - `natural` *(default)*: Auto-profiled hybrid Silero VAD (`--threshold 0.20`) + energy gate — removes long silences while keeping soft verse endings, melodic Maqam sustain, and live audience reactions. Prints a hint if periodic prayer transitions are detected.
-  - `prayer`: Detects periodic Ruku/Sujud windows (`>= 12s`) and Muballigh echo clusters (`14s–65s`), stripping opening and transition Takbirs while strictly preserving Al-Fatihah and Short Surahs.
-  - `strict` *(advanced)*: Filters segments against an adaptive RMS cutoff anchored to the duration-weighted `p25` speech floor (`--strict-margin-db 12.0` default) to drop distant crowd shouts.
-  - `--start` / `--end`: Optional `MM:SS` or `HH:MM:SS` timestamps to trim only a specific section (e.g., recitation before commentary).
+- **Dual-Rate Zero-Loss Pipeline**: Decodes a temporary 16kHz mono stream (with an 80Hz high-pass filter for VAD analysis only) for hybrid Silero VAD + vocal-band energy detection, then maps exact timestamps back to slice and concatenate the **original high-sample-rate audio/video stream** (`soundfile` for `.wav -> .wav`, streaming FFmpeg for `.mp3`, `.m4a`, `.mp4`, `.mkv`, `.webm`, `.opus`, `.flac`).
+- **Auto-Profiler & Data-Driven Vintage Smoothing**:
+  - Automatically classifies clean **Studio** recordings (rejecting close-mic inhalation breaths via high-frequency spectral balance and relaxing sustain down to `p90 - 26 dB` so soft 1960s studio passages stay intact) vs. **Vintage / Live** hall recordings.
+  - Adapts silence thresholds, splice crossfades, breathing gaps, and isolated stray-shout filtering directly from measured noise floor (`p5`) and SNR:
+    - **High ambient / crowd noise** (`floor > -30 dBFS` or `SNR < 18 dB`): `1250ms` min silence, `550ms` gap, `65ms` crossfade, and filters isolated `< 2.5s` stray audience shouts in long pauses while keeping immediate post-verse reactions.
+    - **Moderate vintage** (`-50 < floor <= -30 dBFS` and `SNR >= 18 dB`): `900ms` min silence, `500ms` gap, `65ms` crossfade.
+    - **Studio / quiet floor** (`floor <= -50 dBFS`): `700ms` min silence, `450ms` digital silence gap, `20ms` crossfade.
+  - **Room-Tone Bridge**: When `floor > -50 dBFS`, bridges gaps using authentic low-level ambient floor samples (`p5–p15`) instead of digital silence holes.
+- **Modes, Multi-Range Clipping & Quality Selection**:
+  - `natural` *(default)*: Auto-profiled hybrid Silero VAD (`--threshold 0.20`) + energy gate — preserves soft endings, Maqam sustain, and natural live crowd reactions.
+  - `prayer`: Detects periodic Ruku/Sujud windows (`>= 12s`) and Muballigh echo clusters (`<= 10.8s` bursts inside `14s–65s` spans), stripping opening and transition Takbirs while strictly preserving Al-Fatihah and Short Surahs.
+  - `strict` *(advanced)*: Filters segments against an adaptive RMS cutoff anchored to the duration-weighted `p25` speech floor (`--strict-margin-db 12.0` default).
+  - **Multi-Range & External URLs**: Clean and seamlessly stitch one or more `Start` / `End` (`MM:SS`) time ranges from uploaded files or external `http://` / `https://` links (YouTube, SoundCloud, Archive.org, direct audio links via `yt-dlp`), exporting at `128 kbps`, `192 kbps` *(default)*, `256 kbps`, or `Lossless WAV` *(when uploading `.wav` or `.flac`)*.
 
 ## Setup
 
-Requires `ffmpeg` and `ffprobe` on `PATH` (`packages.txt` provides `ffmpeg` automatically on Debian/Ubuntu/Streamlit Cloud).
+Requires `ffmpeg` and `ffprobe` on `PATH` (`packages.txt` installs `ffmpeg` automatically on Debian/Ubuntu/Streamlit Cloud).
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 ```
 
-`requirements.txt` uses PyTorch's CPU-only wheel index (`--extra-index-url https://download.pytorch.org/whl/cpu`) so cloud builds stay lightweight without multi-gigabyte CUDA dependencies.
+`requirements.txt` uses PyTorch's CPU-only wheel index (`--extra-index-url https://download.pytorch.org/whl/cpu`) so cloud deployments stay lightweight.
 
-## Web App Usage (Streamlit)
+## Web App Usage (أنصتوا | Ansitu)
 
-Launch the bilingual (Arabic-first / English) web interface locally:
+Launch the bilingual Streamlit app locally:
 
 ```powershell
 .\.venv\Scripts\streamlit run app.py
 ```
 
-In the web app you can:
-1. Upload local audio/video files (`mp3`, `wav`, `m4a`, `mp4`, `mkv`, `webm`, `opus`, `flac`) or paste a YouTube URL (with an automatic fallback prompt to upload locally if YouTube blocks datacenter IPs).
-2. Choose **تلاوة طبيعية | Natural** or **صلاة جهرية | Prayer Mode**, optional `Start` / `End` (`MM:SS`) bounds, and export format (`m4a` or `mp3`).
-3. Watch live progress, preview the cleaned audio inline, inspect the Original Duration / Final Duration / Time Saved % / Detected Profile cards, and download the cleaned audio and `timestamps.json`.
+In **أنصتوا — Ansitu** you can:
+1. **📁 رفع ملف صوتي أو فيديو | Upload Audio / Video File** (`mp3`, `wav`, `m4a`, `mp4`, `mkv`, `webm`, `opus`, `flac`) or switch to **🔗 رابط خارجي | External Media URL** (`http://` / `https://` links from YouTube, SoundCloud, Archive.org, or direct media URLs).
+2. Select **تلاوة طبيعية | Natural Recitation** or **صلاة جهرية | Prayer Mode**, output format (`m4a` / `mp3`), quality (`128 kbps`, `192 kbps`, `256 kbps`, plus `Lossless WAV` for `.wav`/`.flac` uploads), and add one or more optional `Start` / `End` clip ranges (`➕ أضف مقطعاً آخر | + Add Range`).
+3. Monitor live progress, preview the cleaned recitation inline, inspect metrics, and download the output + `timestamps.json`.
 
 ### Streamlit Community Cloud Deployment
 
-1. Push this repository to GitHub (the root includes `app.py`, `requirements.txt`, `packages.txt`, and `.streamlit/config.toml`).
-2. Create a new app on [share.streamlit.io](https://share.streamlit.io) pointing to `app.py`.
-3. Streamlit Cloud automatically installs `ffmpeg` from `packages.txt` and CPU-only PyTorch dependencies from `requirements.txt`.
+1. Push this repository to GitHub (`app.py`, `requirements.txt`, `packages.txt`, `.streamlit/config.toml`).
+2. Create an app on [share.streamlit.io](https://share.streamlit.io) pointing to `app.py`.
 
 ## CLI Usage
 
@@ -59,11 +62,8 @@ In the web app you can:
 # Advanced strict mode for vintage live recordings with distant crowd shouts
 .\.venv\Scripts\python quran_trim.py live_tape.mp3 --mode strict
 
-# Custom VAD, padding, and breathing gap settings on video
-.\.venv\Scripts\python quran_trim.py surah.mp4 --threshold 0.20 --pad-start 200 --pad-end 300 --min-silence 700 --gap-ms 450
-
-# Download best audio from YouTube and clean it
-.\.venv\Scripts\python quran_trim.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode natural
+# Download best audio from any supported URL (YouTube, SoundCloud, Archive.org, direct MP3/M4A)
+.\.venv\Scripts\python quran_trim.py "https://archive.org/details/example_recitation" --mode natural
 ```
 
 Outputs are saved next to the input as `<filename>_clean.<ext>` and `timestamps.json` (configurable via `-o` and `--timestamps`).
