@@ -1,4 +1,4 @@
-"""Hybrid Silero VAD + auto-profiler, studio breath filter, prayer mode, and strict calibration."""
+"""Hybrid Silero VAD + auto-profiler, studio breath filter, crowd/murmur cluster filter, and strict calibration."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 
 from .media import VAD_SAMPLE_RATE
 
-Mode = Literal["natural", "prayer", "strict"]
+Mode = Literal["natural", "strict"]
 ProfileType = Literal["studio", "vintage/live"]
 
 _FRAME_SAMPLES = 512  # 32ms windows at 16kHz (matches Silero VAD windowing)
@@ -22,7 +22,7 @@ _VAD_OVERLAP_SECONDS = 2
 
 @dataclass(frozen=True)
 class VADConfig:
-    """Configuration for hybrid Silero VAD, auto-profiling, prayer mode, and gaps."""
+    """Configuration for hybrid Silero VAD, auto-profiling, padding, and gaps."""
 
     mode: Mode = "natural"
     threshold: float = 0.20
@@ -71,8 +71,6 @@ class VADResult:
     strict_cutoff_db: Optional[float]
     raw_segments_count: int
     filtered_segments_count: int
-    prayer_windows_count: int = 0
-    prayer_stripped_count: int = 0
     quietest_gap_window: Optional[tuple[float, float, float]] = None
     resolved_pad_start_ms: int = 200
     resolved_pad_end_ms: int = 300
@@ -443,8 +441,8 @@ def _resolve_profile_params(
         auto_pad_start, auto_pad_end = 200, 300
     else:
         auto_min_sil = 1250 if is_high_ambient else 900
-        auto_gap, auto_xfade = 0, 300
-        auto_pad_start, auto_pad_end = 350, 750
+        auto_gap, auto_xfade = 0, 400
+        auto_pad_start, auto_pad_end = 650, 1100
 
     eff_min_sil = config.min_silence_ms if config.min_silence_ms is not None else auto_min_sil
     eff_gap = config.gap_ms if config.gap_ms is not None else auto_gap
@@ -531,7 +529,7 @@ def _compute_segment_pad_ends_s(
     base_pad_end_ms: int,
     clip_start_s: float,
 ) -> list[float]:
-    """Extend pad_end to 950ms on loud vintage/live endings (core_db >= reciter p75)."""
+    """Extend pad_end to 1300ms on loud vintage/live endings (core_db >= reciter p75)."""
     base_s = base_pad_end_ms / 1000.0
     if config.pad_end_ms is not None or profile.kind == "studio" or not segments:
         return [base_s] * len(segments)
@@ -557,177 +555,8 @@ def _compute_segment_pad_ends_s(
         np.array(seg_durs, dtype=np.float64),
         75.0,
     )
-    loud_s = max(base_s, 0.950)
+    loud_s = max(base_s, 1.300)
     return [loud_s if tc >= reciter_p75 else base_s for tc in tail_cores]
-
-
-def _find_prayer_takbir_indices(
-    segs_s: list[tuple[float, float, float]],
-    sil_250_s: list[tuple[float, float]],
-    total_dur: float,
-    strip_opening: bool = False,
-    clip_start_s: float = 0.0,
-) -> tuple[int, set[int]]:
-    """Detect periodic Ruku/Sujud transitions (and optional opening Takbir) for prayer mode."""
-    if len(segs_s) < 4:
-        return 0, set()
-
-    med_db = float(np.median([x[2] for x in segs_s]))
-    is_recit = [False] * len(segs_s)
-
-    # 1. Mark sustained Al-Fatihah halves, short Surahs, and Rak'ah recitation (> 12.5s).
-    for i, (s, e, _) in enumerate(segs_s):
-        if (e - s) > 12.5:
-            is_recit[i] = True
-
-    # 2. Protect post-Sujud Al-Fatihah clusters right after a long >= 12.0s silence
-    #    (e.g. a ~17-19s Al-Fatihah split by one or two brief < 2.0s pauses).
-    i = 0
-    while i < len(segs_s):
-        if is_recit[i]:
-            i += 1
-            continue
-        gap_prev = (segs_s[i][0] - clip_start_s) if i == 0 else (segs_s[i][0] - segs_s[i - 1][1])
-        if gap_prev >= 12.0:
-            j = i
-            while j + 1 < len(segs_s) and not is_recit[j + 1] and (segs_s[j + 1][0] - segs_s[j][1]) < 2.0:
-                j += 1
-            span = segs_s[j][1] - segs_s[i][0]
-            speech = sum(segs_s[k][1] - segs_s[k][0] for k in range(i, j + 1))
-            max_seg = max(segs_s[k][1] - segs_s[k][0] for k in range(i, j + 1))
-            if speech >= 11.0 and (speech / max(span, 1e-6)) >= 0.70 and max_seg >= 9.0:
-                for k in range(i, j + 1):
-                    is_recit[k] = True
-            i = j + 1
-        else:
-            i += 1
-
-    rakah_blocks: list[tuple[int, int, float]] = []
-    k = 0
-    while k < len(segs_s):
-        if not is_recit[k]:
-            k += 1
-            continue
-        k2 = k
-        while k2 + 1 < len(segs_s) and is_recit[k2 + 1]:
-            k2 += 1
-        dur_block = sum(segs_s[m][1] - segs_s[m][0] for m in range(k, k2 + 1))
-        rakah_blocks.append((k, k2, dur_block))
-        k = k2 + 1
-
-    total_speech = sum(e - s for s, e, _ in segs_s)
-    # Prayers are dominated by sustained unbroken Rak'ah segments (>=22s),
-    # whereas live concerts alternate short phrases with crowd applause.
-    raw_long_speech = sum(e - s for s, e, _ in segs_s if (e - s) >= 22.0)
-    long_speech = sum(b[2] for b in rakah_blocks if b[2] >= 25.0)
-    if (
-        len([b for b in rakah_blocks if b[2] >= 22.0]) < 2
-        or (long_speech / max(total_speech, 1e-6)) < 0.55
-        or (raw_long_speech / max(total_speech, 1e-6)) < 0.65
-    ):
-        return 0, set()
-
-    spans_to_check: list[tuple[int, int, float, float, float, float, bool]] = []
-    for idx in range(len(rakah_blocks) - 1):
-        end_prev = rakah_blocks[idx][1]
-        start_next = rakah_blocks[idx + 1][0]
-        if start_next - end_prev > 1:
-            is_last_partial = (
-                idx + 1 == len(rakah_blocks) - 1
-                and total_dur - segs_s[rakah_blocks[-1][1]][1] < 20.0
-            )
-            spans_to_check.append(
-                (
-                    end_prev + 1,
-                    start_next - 1,
-                    segs_s[end_prev][1],
-                    segs_s[start_next][0],
-                    rakah_blocks[idx][2],
-                    rakah_blocks[idx + 1][2],
-                    is_last_partial,
-                )
-            )
-    last_end = rakah_blocks[-1][1]
-    if last_end < len(segs_s) - 1:
-        spans_to_check.append(
-            (
-                last_end + 1,
-                len(segs_s) - 1,
-                segs_s[last_end][1],
-                total_dur,
-                rakah_blocks[-1][2],
-                0.0,
-                True,
-            )
-        )
-
-    window_count = 0
-    strip_indices: set[int] = set()
-    for i0, i1, w_start, w_end, prev_dur, next_dur, is_last_partial in spans_to_check:
-        w_dur = w_end - w_start
-        if w_dur < 12.0:
-            continue
-        cands = list(range(i0, i1 + 1))
-        speech_sum = sum(segs_s[m][1] - segs_s[m][0] for m in cands)
-        silence_ratio = (w_dur - speech_sum) / w_dur
-        inner_gaps = []
-        cur = w_start
-        for m in cands:
-            inner_gaps.append(segs_s[m][0] - cur)
-            cur = segs_s[m][1]
-        inner_gaps.append(w_end - cur)
-        max_gap = max(inner_gaps)
-        loud_utts = sum(1 for m in cands if segs_s[m][2] >= med_db - 6.0)
-        max_utt_dur = max(segs_s[m][1] - segs_s[m][0] for m in cands)
-
-        # Rule A: Muballigh Ruku/Sujud cluster between two long Rak'ah blocks (>= 25s,
-        # or closing partial Rak'ah > 12.5s at end of file): 14s-65s span of >= 3 utterances all <= 10.8s.
-        is_muballigh_cluster = (
-            prev_dur >= 25.0
-            and (next_dur >= 25.0 or (is_last_partial and next_dur > 12.5))
-            and 14.0 <= w_dur <= 65.0
-            and len(cands) >= 3
-            and max_utt_dur <= 10.8
-            and loud_utts >= 3
-        )
-        if is_muballigh_cluster:
-            window_count += 1
-            strip_indices.update(cands)
-            continue
-
-        # Rule B: Classic high-silence Ruku/Sujud window (>= 35% silence, max gap >= 3.0s).
-        if silence_ratio >= 0.35 and max_gap >= 3.0 and loud_utts >= 2:
-            takbirs_in_win: list[int] = []
-            has_long_verse = False
-            for m in cands:
-                ms, me, _ = segs_s[m]
-                mdur = me - ms
-                inner = [min(me, se) - max(ms, ss) for ss, se in sil_250_s if se > ms and ss < me]
-                max_s = max(inner) if inner else 0.0
-                if mdur <= 6.2 and max_s <= 5.5:
-                    takbirs_in_win.append(m)
-                elif mdur < 12.0 and len(inner) >= 2 and max_s <= 5.5:
-                    takbirs_in_win.append(m)
-                elif mdur >= 7.5:
-                    has_long_verse = True
-            if not has_long_verse and len(takbirs_in_win) >= 2 and len(takbirs_in_win) * 2 >= len(cands):
-                window_count += 1
-                strip_indices.update(takbirs_in_win)
-
-    # A genuine multi-minute prayer contains periodic (>= 2) Ruku/Sujud transitions;
-    # avoid single coincidental matches in long live concerts.
-    if (total_dur - clip_start_s) >= 300.0 and window_count < 2:
-        return 0, set()
-
-    # Opening Takbir (prayer mode only): isolated leading utterance < 5.0s near start
-    # (< 3.0s) followed by a pause >= 2.5s before Al-Fatihah.
-    if strip_opening and window_count >= 1 and len(segs_s) >= 2:
-        s0, e0, _ = segs_s[0]
-        gap0 = segs_s[1][0] - e0
-        if (s0 - clip_start_s) < 3.0 and (e0 - s0) < 5.0 and gap0 >= 2.5:
-            strip_indices.add(0)
-
-    return window_count, strip_indices
 
 
 def _find_quietest_gap_window(
@@ -854,13 +683,12 @@ def detect_speech_segments(
     )
     min_speech_ms = _STUDIO_MIN_SPEECH_MS if profile.kind == "studio" else _MIN_SPEECH_MS
 
-    sil_scale = 0.90 if config.mode == "strict" else 0.50
     silero_intervals = _run_silero_vad_chunked(
         audio_16k=audio_16k,
         threshold=config.threshold,
         island_bridge_ms=island_bridge_ms,
         min_speech_ms=min_speech_ms,
-        progress_cb=(lambda p: progress_cb(p * sil_scale)) if progress_cb is not None else None,
+        progress_cb=(lambda p: progress_cb(p * 0.90)) if progress_cb is not None else None,
     )
 
     # Dense studio recitations with short inter-verse breaths (<700ms) push frame p5
@@ -942,8 +770,6 @@ def detect_speech_segments(
     reciter_median_db: Optional[float] = None
     strict_cutoff_db: Optional[float] = None
     raw_count = len(raw_samples)
-    prayer_windows_count = 0
-    prayer_stripped_count = 0
     stray_stripped_count = 0
 
     if config.mode == "strict":
@@ -996,45 +822,10 @@ def detect_speech_segments(
                 clip_end_s=clip_end_s,
             )
 
-        segs_with_level = [(s, e, c) for s, e, c, _ in segs_raw]
-
-        # Compute unbridged 250ms Silero bursts for Prayer Ruku/Sujud & Auto-Detection Hint.
-        sil_250_raw = _run_silero_vad_chunked(
-            audio_16k=audio_16k,
-            threshold=config.threshold,
-            island_bridge_ms=_ENERGY_BRIDGE_MS,
-            min_speech_ms=min_speech_ms,
-            progress_cb=(
-                (lambda p: progress_cb(0.50 + 0.45 * p))
-                if progress_cb is not None
-                else None
-            ),
-        )
-        sil_250_s = [
-            (
-                clip_start_s + s_idx / float(VAD_SAMPLE_RATE),
-                clip_start_s + e_idx / float(VAD_SAMPLE_RATE),
-            )
-            for s_idx, e_idx in sil_250_raw
-        ]
-        prayer_windows_count, strip_indices = _find_prayer_takbir_indices(
-            segs_s=segs_with_level,
-            sil_250_s=sil_250_s,
-            total_dur=clip_end_s,
-            strip_opening=(config.mode == "prayer"),
-            clip_start_s=clip_start_s,
-        )
-
-        if config.mode == "prayer" and strip_indices:
-            prayer_stripped_count = len(strip_indices)
-            bridged = [
-                Segment(start=s, end=e)
-                for idx, (s, e, _) in enumerate(segs_with_level)
-                if idx not in strip_indices
-            ]
-        else:
-            bridged = [Segment(start=s, end=e) for s, e, _ in segs_with_level]
+        bridged = [Segment(start=s, end=e) for s, e, _, _ in segs_raw]
         filtered_count = len(bridged)
+        if progress_cb is not None:
+            progress_cb(1.0)
 
     pad_ends_s = _compute_segment_pad_ends_s(
         analysis_audio=analysis_audio,
@@ -1095,8 +886,6 @@ def detect_speech_segments(
         ),
         raw_segments_count=raw_count,
         filtered_segments_count=filtered_count,
-        prayer_windows_count=prayer_windows_count,
-        prayer_stripped_count=prayer_stripped_count,
         quietest_gap_window=quiet_gap,
         resolved_pad_start_ms=eff_pad_start,
         resolved_pad_end_ms=eff_pad_end,

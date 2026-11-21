@@ -23,11 +23,6 @@ from quran_cleaner.vad import VADConfig, VADResult, detect_speech_segments
 # Backward-compatible export alias used by tests or callers referencing legacy name.
 download_youtube_audio = download_external_audio
 
-_MODE_LABELS = {
-    "natural": "تلاوة طبيعية | Natural Recitation",
-    "prayer": "صلاة جهرية | Prayer Mode",
-}
-
 _FORMAT_LABELS = {
     "m4a": "M4A — جودة عالية (AAC High Quality)",
     "mp3": "MP3 — متوافق مع كل الأجهزة (Universal)",
@@ -133,7 +128,7 @@ format_youtube_error = format_external_url_error
 
 def run_cleaning_job(
     *,
-    mode: str,
+    mode: str = "natural",
     start_text: str = "",
     end_text: str = "",
     ranges: Optional[Sequence[tuple[str, str]]] = None,
@@ -149,6 +144,9 @@ def run_cleaning_job(
     def _report(pct: int, msg: str) -> None:
         if progress_cb is not None:
             progress_cb(max(0, min(100, pct)), msg)
+
+    if mode not in {"natural", "strict"}:
+        raise ValueError(f"Unsupported mode: {mode}")
 
     src_url = external_url if external_url is not None else youtube_url
 
@@ -304,8 +302,6 @@ def run_cleaning_job(
             "profile_kind": primary_vad.profile.kind,
             "noise_floor_p5_db": primary_vad.profile.noise_floor_p5_db,
             "snr_db": primary_vad.profile.snr_db,
-            "prayer_windows_detected": sum(vr.prayer_windows_count for _, _, vr in range_jobs),
-            "prayer_segments_stripped": sum(vr.prayer_stripped_count for _, _, vr in range_jobs),
             "stray_shouts_stripped": sum(vr.stray_shouts_stripped for _, _, vr in range_jobs),
             "room_tone_bridge": any(vr.use_room_tone for _, _, vr in range_jobs),
             "direct_overlap": any(vr.direct_overlap for _, _, vr in range_jobs),
@@ -420,21 +416,6 @@ def _render_metrics_card(res: dict[str, Any]) -> None:
                 unsafe_allow_html=True,
             )
 
-    if res["mode"] == "prayer":
-        st.info(
-            f"🕌 تم فحص **{res['prayer_windows_detected']}** انتقالة ركوع/سجود وحذف "
-            f"**{res['prayer_segments_stripped']}** مقطع تكبير/مبلّغ مع الحفاظ على الفاتحة والقراءة.\n\n"
-            f"Detected **{res['prayer_windows_detected']}** Ruku/Sujud windows and stripped "
-            f"**{res['prayer_segments_stripped']}** Takbir/Muballigh segments."
-        )
-    elif res["mode"] == "natural" and res["prayer_windows_detected"] >= 2:
-        st.info(
-            f"💡 **تلميح | Hint:** تم رصد **{res['prayer_windows_detected']}** انتقالة صلاة (ركوع/سجود). "
-            "لإزالة التكبيرات وصوت المبلّغ مع إبقاء الفاتحة والسور، اختر وضع **صلاة جهرية | Prayer Mode**.\n\n"
-            f"Detected **{res['prayer_windows_detected']}** periodic Ruku/Sujud transitions — switch to "
-            "**Prayer Mode** to remove Imam/Muballigh Takbirs."
-        )
-
 
 def _execute_with_progress(**job_kwargs: Any) -> None:
     progress_bar = st.progress(0)
@@ -475,8 +456,8 @@ def main() -> None:
         """
         <div class="quran-hero">
             <h1>🕌 أنصتوا — Ansitu</h1>
-            <p>أداة متخصصة لتنقية التلاوات القرآنية من السكتات الطويلة، والتكبيرات في صلوات التراويح والتهجد، مع الحفاظ التام على دفء التسجيلات التراثية وجودة الصوت الأصلية بدون تشويه.</p>
-            <p>Zero-quality-loss Quran recitation cleaner: removes dead silences, breaths &amp; prayer transitions while preserving vintage tape warmth and full dynamic range.</p>
+            <p>أداة متخصصة لتنقية التلاوات القرآنية من السكتات الطويلة وهمهمات الجمهور والأنفاس مع قص ودمج المقاطع المختارة بدقة، والحفاظ التام على دفء التسجيلات التراثية وجودة الصوت الأصلية.</p>
+            <p>Zero-quality-loss Quran recitation cleaner: removes dead silences, breaths &amp; isolated crowd murmurs with flexible multi-range clipping while preserving vintage tape warmth and full dynamic range.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -509,14 +490,7 @@ def main() -> None:
 
     with st.container(border=True):
         st.markdown("#### ⚙️ إعدادات التنقية | Settings")
-        col_mode, col_fmt = st.columns(2)
-        with col_mode:
-            mode = st.radio(
-                "وضع التشغيل | Mode",
-                options=["natural", "prayer"],
-                format_func=lambda m: _MODE_LABELS[m],
-                index=0,
-            )
+        col_fmt, col_qual = st.columns(2)
         with col_fmt:
             out_format = st.radio(
                 "صيغة الإخراج | Output Format",
@@ -531,17 +505,18 @@ def main() -> None:
             and st.session_state["audio_quality_select"] not in q_options
         ):
             del st.session_state["audio_quality_select"]
-        quality = st.selectbox(
-            "جودة الصوت | Audio Quality",
-            options=q_options,
-            format_func=lambda q: _QUALITY_LABELS[q],
-            index=q_options.index("192"),
-            key="audio_quality_select",
-        )
-        if quality == "lossless_wav":
-            st.caption(
-                "🎧 سيتم التصدير بصيغة WAV غير مضغوطة (Lossless PCM) مع الحفاظ على كامل جودة التسجيل الأصلي."
+        with col_qual:
+            quality = st.selectbox(
+                "جودة الصوت | Audio Quality",
+                options=q_options,
+                format_func=lambda q: _QUALITY_LABELS[q],
+                index=q_options.index("192"),
+                key="audio_quality_select",
             )
+            if quality == "lossless_wav":
+                st.caption(
+                    "🎧 سيتم التصدير بصيغة WAV غير مضغوطة (Lossless PCM) مع الحفاظ على كامل جودة التسجيل الأصلي."
+                )
 
         st.markdown("##### ✂️ نطاقات التلاوة (اختياري) | Clip Ranges (Optional · Full file if blank)")
         clip_rows = _ensure_range_state()
@@ -592,7 +567,7 @@ def main() -> None:
         ):
             assert uploaded is not None
             _execute_with_progress(
-                mode=mode,
+                mode="natural",
                 ranges=selected_ranges,
                 out_format=out_format,
                 quality=quality,
@@ -608,7 +583,7 @@ def main() -> None:
             key="run_external_btn",
         ):
             _execute_with_progress(
-                mode=mode,
+                mode="natural",
                 ranges=selected_ranges,
                 out_format=out_format,
                 quality="192" if quality == "lossless_wav" else quality,

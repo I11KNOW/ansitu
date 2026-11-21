@@ -1149,8 +1149,6 @@ def write_timestamps_json(
     clip_start_s: Optional[float] = None,
     clip_end_s: Optional[float] = None,
     original_duration: Optional[float] = None,
-    prayer_windows_detected: Optional[int] = None,
-    prayer_segments_stripped: Optional[int] = None,
     stray_shouts_stripped: Optional[int] = None,
     bitrate_kbps: Optional[int] = None,
     range_summaries: Optional[list[dict[str, object]]] = None,
@@ -1159,16 +1157,6 @@ def write_timestamps_json(
     original = original_duration if original_duration is not None else vad_result.total_duration
     saved_s = max(0.0, original - final_duration)
     saved_pct = (saved_s / original * 100.0) if original > 0 else 0.0
-    p_wins = (
-        prayer_windows_detected
-        if prayer_windows_detected is not None
-        else vad_result.prayer_windows_count
-    )
-    p_stripped = (
-        prayer_segments_stripped
-        if prayer_segments_stripped is not None
-        else vad_result.prayer_stripped_count
-    )
     s_stripped = (
         stray_shouts_stripped
         if stray_shouts_stripped is not None
@@ -1209,8 +1197,6 @@ def write_timestamps_json(
             "time_saved_s": round(saved_s, 4),
             "time_saved_pct": round(saved_pct, 2),
             "segments_kept": len(final_segments),
-            "prayer_windows_detected": p_wins,
-            "prayer_segments_stripped": p_stripped,
             "stray_shouts_stripped": s_stripped,
         },
         "segments": [
@@ -1444,8 +1430,6 @@ def render_clean_ranges(
         final_duration=final_duration,
         source_duration=info.duration,
         original_duration=original,
-        prayer_windows_detected=sum(vr.prayer_windows_count for vr in range_results),
-        prayer_segments_stripped=sum(vr.prayer_stripped_count for vr in range_results),
         stray_shouts_stripped=sum(vr.stray_shouts_stripped for vr in range_results),
         bitrate_kbps=bitrate_kbps,
         range_summaries=range_summaries,

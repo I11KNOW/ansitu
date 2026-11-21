@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quran-trim",
         description=(
-            "Zero-config Quran recitation silence, breath, and Ruku/Sujud gap remover "
+            "Zero-config Quran recitation silence, breath, and murmur gap remover "
             "using an auto-profiled dual-rate Silero VAD + vocal-band energy pipeline."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -49,13 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=["natural", "prayer", "strict"],
+        choices=["natural", "strict"],
         default="natural",
         help=(
             "natural (default): Auto-profiled studio/vintage pipeline preserving soft "
-            "endings and live crowd reactions; "
-            "prayer: strips Imam/Muballigh Takbirs inside Ruku/Sujud windows while "
-            "keeping Al-Fatihah and Short Surahs; "
+            "endings and hall ambience while filtering isolated crowd murmurs; "
             "strict (advanced): adaptive p25 RMS filter to drop distant crowd shouts."
         ),
     )
@@ -84,14 +82,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="MS",
-        help="Padding kept before each speech onset in ms (auto: 350ms vintage/live, 200ms studio).",
+        help="Padding kept before each speech onset in ms (auto: 650ms vintage/live, 200ms studio).",
     )
     parser.add_argument(
         "--pad-end",
         type=int,
         default=None,
         metavar="MS",
-        help="Padding kept after each speech ending in ms (auto: 750-950ms vintage/live, 300ms studio).",
+        help="Padding kept after each speech ending in ms (auto: 1100-1300ms vintage/live, 300ms studio).",
     )
     parser.add_argument(
         "--min-silence",
@@ -206,11 +204,6 @@ def _print_summary(
     )
     if vad_result.stray_shouts_stripped > 0:
         print(f"Crowd Filtering     : {vad_result.stray_shouts_stripped} isolated background murmur/shout segments stripped")
-    if mode == "prayer":
-        print(
-            f"Prayer Transitions  : {vad_result.prayer_windows_count} Ruku/Sujud windows "
-            f"({vad_result.prayer_stripped_count} Takbir/Muballigh segments stripped)"
-        )
     if (
         mode == "strict"
         and vad_result.reciter_median_db is not None
@@ -227,14 +220,6 @@ def _print_summary(
     print("-" * 48)
     print(f"Cleaned File        : {result.output_path}")
     print(f"Timestamps Log      : {result.timestamps_path}")
-
-    if mode == "natural" and vad_result.prayer_windows_count >= 2:
-        print()
-        print(
-            f"Hint: Detected {vad_result.prayer_windows_count} periodic Ruku/Sujud prayer "
-            "transition windows. Re-run with --mode prayer to strip Imam/Muballigh "
-            "Takbirs while preserving Al-Fatihah and Short Surahs."
-        )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
