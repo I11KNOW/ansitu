@@ -18,7 +18,8 @@ from .media import MediaInfo, require_ffmpeg
 from .vad import Segment, VADConfig, VADResult
 
 _DECODE_CHUNK_FRAMES = 32768
-_MAX_EDGE_FADE_MS = 5.0
+_EDGE_FADE_IN_MS = 150
+_EDGE_FADE_OUT_MS = 500
 _AUDIO_ONLY_EXTENSIONS = {".mp3", ".m4a", ".wav", ".opus", ".ogg", ".flac"}
 
 _Y4M_BYTES_PER_PIXEL: dict[str, float] = {
@@ -75,8 +76,9 @@ def _equal_power_curves(length: int) -> tuple[np.ndarray, np.ndarray]:
 class CrossfadeSegmentStream:
     """Streaming equal-power crossfade blender for sequential audio segments.
 
-    Splices segments cleanly using an equal-power (cos/sin) 20ms crossfade
-    without loading the full high-sample-rate audio file into RAM.
+    Splices segments cleanly using an equal-power (cos/sin) crossfade without
+    loading the full high-sample-rate audio file into RAM, and applies gentle
+    output boundary fade-in/fade-out ramps to prevent edge clicks.
     """
 
     def __init__(
@@ -85,8 +87,10 @@ class CrossfadeSegmentStream:
         channels: int,
         crossfade_ms: int,
         write_fn: Callable[[np.ndarray], None],
-        fade_start_edge: bool = False,
-        fade_end_edge: bool = False,
+        fade_start_edge: bool = True,
+        fade_end_edge: bool = True,
+        edge_fade_in_ms: int = _EDGE_FADE_IN_MS,
+        edge_fade_out_ms: int = _EDGE_FADE_OUT_MS,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
@@ -94,11 +98,20 @@ class CrossfadeSegmentStream:
         self._write_fn = write_fn
         self._fade_out, self._fade_in = _equal_power_curves(self.fade_samples)
 
-        edge_target = int(round((_MAX_EDGE_FADE_MS / 1000.0) * sample_rate))
-        self._edge_samples = min(self.fade_samples, edge_target) if self.fade_samples > 0 else 0
-        self._start_fade_remaining = self._edge_samples if fade_start_edge else 0
-        self._start_fade_total = self._edge_samples
-        self._fade_end_edge = fade_end_edge
+        fade_in_samples = (
+            max(0, int(round((edge_fade_in_ms / 1000.0) * sample_rate)))
+            if fade_start_edge
+            else 0
+        )
+        fade_out_samples = (
+            max(0, int(round((edge_fade_out_ms / 1000.0) * sample_rate)))
+            if fade_end_edge
+            else 0
+        )
+        self._start_fade_remaining = fade_in_samples
+        self._start_fade_total = fade_in_samples
+        self._end_fade_samples = fade_out_samples
+        self._fade_end_edge = fade_end_edge and fade_out_samples > 0
 
         self._prev_tail: Optional[np.ndarray] = None
         self._head_chunks: list[np.ndarray] = []
@@ -158,17 +171,10 @@ class CrossfadeSegmentStream:
             if chunk.shape[0] == 0:
                 return
 
-        if self.fade_samples == 0:
+        keep = self._end_fade_samples if is_last_segment else self.fade_samples
+        if keep == 0:
             self._emit(chunk)
             return
-
-        if is_last_segment:
-            if not self._fade_end_edge:
-                self._emit(chunk)
-                return
-            keep = self._edge_samples
-        else:
-            keep = self.fade_samples
 
         combined = (
             np.concatenate([self._tail_buf, chunk], axis=0)
@@ -192,13 +198,33 @@ class CrossfadeSegmentStream:
             self._head_chunks.clear()
             self._head_len = 0
             n = min(self._prev_tail.shape[0], full_head.shape[0])
+            parts: list[np.ndarray] = []
             if n > 0:
-                self._emit(self._blend(self._prev_tail[:n], full_head[:n]))
+                parts.append(self._blend(self._prev_tail[:n], full_head[:n]))
             if self._prev_tail.shape[0] > n:
-                self._emit(self._prev_tail[n:])
+                parts.append(self._prev_tail[n:])
             self._prev_tail = None
-            if full_head.shape[0] > n:
-                self._tail_buf = full_head[n:]
+            if is_last_segment and self._end_fade_samples > 0:
+                if self._tail_buf.shape[0] > 0:
+                    parts.append(self._tail_buf)
+                if full_head.shape[0] > n:
+                    parts.append(full_head[n:])
+                combined = (
+                    np.concatenate(parts, axis=0)
+                    if parts
+                    else np.empty((0, self.channels), dtype=np.float64)
+                )
+                if combined.shape[0] > self._end_fade_samples:
+                    emit_len = combined.shape[0] - self._end_fade_samples
+                    self._emit(combined[:emit_len])
+                    self._tail_buf = combined[emit_len:]
+                else:
+                    self._tail_buf = combined
+            else:
+                for p in parts:
+                    self._emit(p)
+                if full_head.shape[0] > n:
+                    self._tail_buf = full_head[n:]
 
         if not is_last_segment:
             self._prev_tail = self._tail_buf
@@ -350,14 +376,15 @@ def _build_sample_ranges(
     total_frames: Optional[int],
     fade_samples: int,
     extend_last: bool = False,
+    extend_tails: bool = True,
 ) -> list[tuple[int, int]]:
-    """Convert time segments to sample intervals with tail extension for exact crossfade duration."""
+    """Convert time segments to sample intervals, extending tails only when gaps/video require it."""
     ranges: list[tuple[int, int]] = []
     last_idx = len(segments) - 1
     for idx, seg in enumerate(segments):
         s_frame = max(0, int(round(seg.start * sample_rate)))
         e_frame = max(s_frame + 1, int(round(seg.end * sample_rate)))
-        if (idx < last_idx or extend_last) and fade_samples > 0:
+        if extend_tails and (idx < last_idx or extend_last) and fade_samples > 0:
             e_frame += fade_samples
             if idx < last_idx:
                 next_start = max(0, int(round(segments[idx + 1].start * sample_rate)))
@@ -384,16 +411,17 @@ def _build_range_stream_items(
     last_range_idx = len(range_results) - 1
     for r_idx, vr in enumerate(range_results):
         is_last_range = r_idx == last_range_idx
+        gap_samples = max(0, int(round((vr.resolved_gap_ms / 1000.0) * sr)))
         s_ranges = _build_sample_ranges(
             vr.segments,
             sr,
             total_frames,
             fade_samples,
             extend_last=not is_last_range,
+            extend_tails=gap_samples > 0,
         )
         if not s_ranges:
             continue
-        gap_samples = max(0, int(round((vr.resolved_gap_ms / 1000.0) * sr)))
         needs_gap = gap_samples > 0 and (len(s_ranges) > 1 or not is_last_range)
         gap_buf = (
             _build_room_tone_buffer(
@@ -450,9 +478,6 @@ def _process_wav_soundfile(
         if not items:
             raise RuntimeError("No valid audio sample ranges remained after slicing.")
 
-        fade_start = items[0][0] > 0
-        fade_end = items[-1][1] < total_frames
-
         with sf.SoundFile(
             str(output_path),
             mode="w",
@@ -469,8 +494,8 @@ def _process_wav_soundfile(
                 channels=channels,
                 crossfade_ms=crossfade_ms,
                 write_fn=_write,
-                fade_start_edge=fade_start,
-                fade_end_edge=fade_end,
+                fade_start_edge=True,
+                fade_end_edge=True,
             )
 
             total_items = float(len(items))
@@ -699,8 +724,8 @@ def _encode_stream_items(
     ffmpeg_bin, _ = require_ffmpeg()
     sr = info.sample_rate
     channels = info.channels
-    fade_start = items[0][0] > 0
-    fade_end = items[-1][1] < max(0, est_total_frames - int(0.05 * sr))
+    fade_start = True
+    fade_end = True
 
     enc_cmd = [
         ffmpeg_bin,
@@ -1163,12 +1188,15 @@ def write_timestamps_json(
         },
         "settings": {
             "threshold": config.threshold,
-            "pad_start_ms": config.pad_start_ms,
-            "pad_end_ms": config.pad_end_ms,
+            "pad_start_ms": vad_result.resolved_pad_start_ms,
+            "pad_end_ms": vad_result.resolved_pad_end_ms,
             "min_silence_ms": vad_result.resolved_min_silence_ms,
             "crossfade_ms": vad_result.resolved_crossfade_ms,
             "gap_ms": vad_result.resolved_gap_ms,
+            "direct_reverb_overlap": vad_result.direct_overlap,
             "room_tone_bridge": vad_result.use_room_tone,
+            "edge_fade_in_ms": _EDGE_FADE_IN_MS,
+            "edge_fade_out_ms": _EDGE_FADE_OUT_MS,
             "bitrate_kbps": bitrate_kbps,
             "strict_margin_db": config.strict_margin_db if config.mode == "strict" else None,
             "clip_start_s": round(clip_start_s, 4) if clip_start_s is not None else None,

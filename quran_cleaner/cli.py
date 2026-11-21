@@ -82,16 +82,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pad-start",
         type=int,
-        default=200,
+        default=None,
         metavar="MS",
-        help="Padding kept before each speech onset in milliseconds.",
+        help="Padding kept before each speech onset in ms (auto: 350ms vintage/live, 200ms studio).",
     )
     parser.add_argument(
         "--pad-end",
         type=int,
-        default=300,
+        default=None,
         metavar="MS",
-        help="Padding kept after each speech ending in milliseconds (protects Ghunnah/Waqf).",
+        help="Padding kept after each speech ending in ms (auto: 750-950ms vintage/live, 300ms studio).",
     )
     parser.add_argument(
         "--min-silence",
@@ -152,9 +152,9 @@ def build_parser() -> argparse.ArgumentParser:
 def _validate_args(args: argparse.Namespace) -> tuple[Optional[float], Optional[float]]:
     if not (0.0 < args.threshold < 1.0):
         raise ValueError("--threshold must be strictly between 0.0 and 1.0.")
-    if args.pad_start < 0:
+    if args.pad_start is not None and args.pad_start < 0:
         raise ValueError("--pad-start must be >= 0 ms.")
-    if args.pad_end < 0:
+    if args.pad_end is not None and args.pad_end < 0:
         raise ValueError("--pad-end must be >= 0 ms.")
     if args.min_silence is not None and args.min_silence < 0:
         raise ValueError("--min-silence must be >= 0 ms.")
@@ -193,13 +193,19 @@ def _print_summary(
         s_lbl = _format_duration(clip_start_s or 0.0).split(" (")[0]
         e_lbl = _format_duration(clip_end_s or vad_result.total_duration).split(" (")[0]
         print(f"Clip Range          : {s_lbl} -> {e_lbl}")
-    gap_kind = "room-tone bridge" if vad_result.use_room_tone else "digital silence"
+    if vad_result.direct_overlap:
+        gap_kind = "direct reverb overlap"
+    elif vad_result.use_room_tone:
+        gap_kind = "room-tone bridge"
+    else:
+        gap_kind = "digital silence"
     print(
         f"Adaptive Tuning     : min-silence {vad_result.resolved_min_silence_ms} ms, "
+        f"pad {vad_result.resolved_pad_start_ms}/{vad_result.resolved_pad_end_ms} ms, "
         f"gap {gap_ms} ms ({gap_kind}), xfade {vad_result.resolved_crossfade_ms} ms"
     )
     if vad_result.stray_shouts_stripped > 0:
-        print(f"Stray Shouts        : {vad_result.stray_shouts_stripped} isolated background shouts stripped")
+        print(f"Crowd Filtering     : {vad_result.stray_shouts_stripped} isolated background murmur/shout segments stripped")
     if mode == "prayer":
         print(
             f"Prayer Transitions  : {vad_result.prayer_windows_count} Ruku/Sujud windows "

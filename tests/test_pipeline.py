@@ -247,21 +247,27 @@ class EndToEndPipelineTests(unittest.TestCase):
 
         data = json.loads(ts_json.read_text(encoding="utf-8"))
         self.assertEqual(data["mode"], "natural")
+        self.assertEqual(data["settings"]["pad_start_ms"], 350)
+        self.assertEqual(data["settings"]["pad_end_ms"], 750)
         self.assertEqual(data["settings"]["min_silence_ms"], 900)
-        self.assertEqual(data["settings"]["crossfade_ms"], 65)
-        self.assertEqual(data["settings"]["gap_ms"], 500)
-        self.assertTrue(data["settings"]["room_tone_bridge"])
-        # Should keep 3 segments: verse1, crowd shout, and verse2 (2a+350ms+2b bridged)
+        self.assertEqual(data["settings"]["crossfade_ms"], 300)
+        self.assertEqual(data["settings"]["gap_ms"], 0)
+        self.assertTrue(data["settings"]["direct_reverb_overlap"])
+        self.assertFalse(data["settings"]["room_tone_bridge"])
+        self.assertEqual(data["settings"]["edge_fade_in_ms"], 150)
+        self.assertEqual(data["settings"]["edge_fade_out_ms"], 500)
+        # Keep verse1, crowd shout, and verse2 (gap_after ~1.69s < 1.8s in fixture) with 2 direct 300ms overlaps
         self.assertEqual(data["summary"]["segments_kept"], 3)
-        expected_dur = sum(s["duration_s"] for s in data["segments"]) + 2 * 0.500
+        self.assertEqual(data["summary"]["stray_shouts_stripped"], 0)
+        expected_dur = sum(s["duration_s"] for s in data["segments"]) - 2 * 0.300
         self.assertAlmostEqual(data["summary"]["final_duration_s"], expected_dur, places=2)
-        self.assertGreater(data["summary"]["time_saved_pct"], 20.0)
+        self.assertGreater(data["summary"]["time_saved_pct"], 18.0)
 
         # Verify untouched core samples in verse1 match original PCM_24 values without denoising/compression
         clean_audio, _ = sf.read(str(clean_wav), dtype="float64")
         seg0 = data["segments"][0]
         s0_orig = int(round(seg0["start_s"] * 48000))
-        core_offset = int(0.35 * 48000)
+        core_offset = int(0.40 * 48000)
         core_len = int(0.8 * 48000)
         diff = np.max(
             np.abs(
@@ -271,17 +277,18 @@ class EndToEndPipelineTests(unittest.TestCase):
         )
         self.assertLess(diff, 2e-6)
 
-        # Verify 500ms room-tone breathing gap between segment 0 and segment 1 preserves floor ambience
-        gap_start = int(round(seg0["duration_s"] * 48000))
-        gap_mid = clean_audio[gap_start + int(0.08 * 48000) : gap_start + int(0.42 * 48000), 0]
-        gap_rms_db = float(20.0 * np.log10(np.sqrt(np.mean(gap_mid * gap_mid) + 1e-12)))
-        self.assertGreater(gap_rms_db, -70.0)
-        self.assertLess(gap_rms_db, -44.0)
-
-        # Verify smooth splice transitions across both boundaries of the inserted gap
-        window = clean_audio[gap_start - 2000 : gap_start + int(0.50 * 48000) + 2000, 0]
+        # Verify smooth splice transitions across direct 300ms reverb-tail overlap
+        overlap_end = int(round(seg0["duration_s"] * 48000))
+        overlap_start = max(0, overlap_end - int(0.30 * 48000))
+        window = clean_audio[max(0, overlap_start - 1000) : overlap_end + 1000, 0]
         max_step = float(np.max(np.abs(np.diff(window))))
         self.assertLess(max_step, 0.05)
+
+        # Verify gentle 150ms start fade-in & 500ms end fade-out keep outer edges near digital zero
+        start_edge_peak = float(np.max(np.abs(clean_audio[: int(0.005 * 48000)])))
+        end_edge_peak = float(np.max(np.abs(clean_audio[-int(0.005 * 48000) :])))
+        self.assertLess(start_edge_peak, 5e-3)
+        self.assertLess(end_edge_peak, 5e-3)
 
     def test_wav_strict_mode_filters_crowd(self) -> None:
         out_dir = self.work_dir / "wav_strict"
@@ -588,8 +595,10 @@ class EndToEndPipelineTests(unittest.TestCase):
 
         pry = detect_speech_segments(arr.astype(np.float32), VADConfig(mode="prayer"), exact_duration=dur)
         self.assertEqual(pry.prayer_stripped_count, 3)
-        # Rak'ah 1 (Al-Fatihah + Short Surah) + Rak'ah 2 preserved; all 3 Takbirs stripped
-        self.assertEqual(len(pry.segments), 3)
+        # Al-Fatihah + Short Surah (separated by 1.5s Ameen inside 1.3s+0.3s overlap envelope) + Rak'ah 2 kept; all 3 Takbirs stripped
+        self.assertEqual(len(pry.segments), 2)
+        self.assertTrue(pry.segments[0].start <= 1.0 and pry.segments[0].end >= 38.0)
+        self.assertTrue(pry.segments[1].start <= 84.0 and pry.segments[1].end >= 109.0)
 
     def test_clip_range_start_end(self) -> None:
         out_dir = self.work_dir / "clip_test"
@@ -654,7 +663,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         nat = detect_speech_segments(arr.astype(np.float32), VADConfig(mode="natural"), exact_duration=dur)
         self.assertGreaterEqual(nat.prayer_windows_count, 1)
         self.assertEqual(nat.prayer_stripped_count, 0)
-        self.assertEqual(len(nat.segments), 6)
+        self.assertEqual(len(nat.segments), 3)
 
         pry = detect_speech_segments(arr.astype(np.float32), VADConfig(mode="prayer"), exact_duration=dur)
         self.assertEqual(pry.prayer_stripped_count, 4)
@@ -674,12 +683,13 @@ class EndToEndPipelineTests(unittest.TestCase):
             uploaded_bytes=self.fixture_wav.read_bytes(),
             progress_cb=lambda pct, msg: progress_events.append((pct, msg)),
         )
-        self.assertEqual(res_m4a["output_filename"], "vintage_clean.m4a")
+        self.assertEqual(res_m4a["output_filename"], "vintage [أنصتوا].m4a")
         self.assertGreater(len(res_m4a["audio_bytes"]), 1000)
         self.assertGreaterEqual(len(progress_events), 4)
         self.assertEqual(progress_events[-1][0], 100)
         self.assertEqual(res_m4a["segments_kept"], 3)
         self.assertEqual(res_m4a["profile_kind"], "vintage/live")
+        self.assertTrue(res_m4a["direct_overlap"])
 
         m4a_probe_path = self.work_dir / "web_out.m4a"
         m4a_probe_path.write_bytes(res_m4a["audio_bytes"])
@@ -722,7 +732,7 @@ class EndToEndPipelineTests(unittest.TestCase):
             uploaded_name="video_recitation.mp4",
             uploaded_bytes=mp4_path.read_bytes(),
         )
-        self.assertEqual(res_mp3["output_filename"], "video_recitation_clean.mp3")
+        self.assertEqual(res_mp3["output_filename"], "video_recitation [أنصتوا].mp3")
         mp3_probe_path = self.work_dir / "web_out.mp3"
         mp3_probe_path.write_bytes(res_mp3["audio_bytes"])
         mp3_info = probe_media(mp3_probe_path)
@@ -747,7 +757,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertIn("Upload Audio/Video File", msg)
 
     def test_adaptive_room_tone_and_high_ambient_stray_shouts(self) -> None:
-        """Verify high-ambient adaptive params (1250/550/65), stray shout removal, and studio silence."""
+        """Verify high-ambient direct overlap (1250/0/300), stray shout removal, and studio digital silence."""
         sr = 48000
         rng = np.random.default_rng(123)
 
@@ -790,27 +800,31 @@ class EndToEndPipelineTests(unittest.TestCase):
         live_ts = json.loads((self.work_dir / "timestamps.json").read_text(encoding="utf-8"))
         self.assertEqual(live_ts["profile"]["detected"], "vintage/live")
         self.assertGreater(live_ts["profile"]["noise_floor_p5_db"], -30.0)
+        self.assertEqual(live_ts["settings"]["pad_start_ms"], 350)
+        self.assertEqual(live_ts["settings"]["pad_end_ms"], 750)
         self.assertEqual(live_ts["settings"]["min_silence_ms"], 1250)
-        self.assertEqual(live_ts["settings"]["gap_ms"], 550)
-        self.assertEqual(live_ts["settings"]["crossfade_ms"], 65)
-        self.assertTrue(live_ts["settings"]["room_tone_bridge"])
+        self.assertEqual(live_ts["settings"]["gap_ms"], 0)
+        self.assertEqual(live_ts["settings"]["crossfade_ms"], 300)
+        self.assertTrue(live_ts["settings"]["direct_reverb_overlap"])
+        self.assertFalse(live_ts["settings"]["room_tone_bridge"])
         self.assertEqual(live_ts["summary"]["stray_shouts_stripped"], 1)
 
         kept_segs = live_ts["segments"]
-        # Stray shout around 8.1s must be absent; Verse 1 (~2.5s), Verse 2 + immediate reaction (~17.0s) kept
+        # Stray shout around 8.1s stripped; Verse 1 (~2.5s), Verse 2 + immediate reaction (~17.0s) kept
         self.assertFalse(any(s["start_s"] <= 8.1 <= s["end_s"] for s in kept_segs))
         self.assertTrue(any(s["start_s"] <= 2.5 <= s["end_s"] for s in kept_segs))
         self.assertTrue(any(s["start_s"] <= 17.0 <= s["end_s"] for s in kept_segs))
 
-        # Check gap interior preserves continuous hall floor ambience (~ -26 dBFS, NOT zero digital silence)
+        # Check direct 300ms overlap splice maintains continuous hall floor ambience (no zero hole)
         clean_live, _ = sf.read(str(self.work_dir / "high_ambient_live_clean.wav"), dtype="float64", always_2d=True)
-        g_start = int(round(kept_segs[0]["duration_s"] * sr))
-        g_mid = clean_live[g_start + int(0.08 * sr) : g_start + int(0.47 * sr), 0]
-        g_rms_db = float(20.0 * np.log10(np.sqrt(np.mean(g_mid * g_mid) + 1e-12)))
-        self.assertGreater(g_rms_db, -36.0)
-        self.assertLess(g_rms_db, -20.0)
+        splice_end = int(round(kept_segs[0]["duration_s"] * sr))
+        splice_start = max(0, splice_end - int(0.30 * sr))
+        overlap_mid = clean_live[splice_start : splice_end, 0]
+        overlap_rms_db = float(20.0 * np.log10(np.sqrt(np.mean(overlap_mid * overlap_mid) + 1e-12)))
+        self.assertGreater(overlap_rms_db, -36.0)
+        self.assertLess(overlap_rms_db, -18.0)
 
-        # 2. Studio recording (-64 dBFS floor): pure digital silence (700/450/20), no room-tone bridge
+        # 2. Studio recording (-64 dBFS floor): pure digital silence (700/450/20, pad 200/300)
         studio_dur_s = 11.0
         studio_amp = 10.0 ** (-64.0 / 20.0)
         studio = rng.normal(0.0, studio_amp, int(studio_dur_s * sr))
@@ -826,9 +840,12 @@ class EndToEndPipelineTests(unittest.TestCase):
 
         studio_ts = json.loads(studio_ts_p.read_text(encoding="utf-8"))
         self.assertEqual(studio_ts["profile"]["detected"], "studio")
+        self.assertEqual(studio_ts["settings"]["pad_start_ms"], 200)
+        self.assertEqual(studio_ts["settings"]["pad_end_ms"], 300)
         self.assertEqual(studio_ts["settings"]["min_silence_ms"], 700)
         self.assertEqual(studio_ts["settings"]["gap_ms"], 450)
         self.assertEqual(studio_ts["settings"]["crossfade_ms"], 20)
+        self.assertFalse(studio_ts["settings"]["direct_reverb_overlap"])
         self.assertFalse(studio_ts["settings"]["room_tone_bridge"])
 
         clean_studio, _ = sf.read(str(studio_out), dtype="float64", always_2d=True)
@@ -862,7 +879,7 @@ class EndToEndPipelineTests(unittest.TestCase):
             uploaded_name="source_lossless.flac",
             uploaded_bytes=flac_path.read_bytes(),
         )
-        self.assertEqual(res_wav["output_filename"], "source_lossless_clean.wav")
+        self.assertEqual(res_wav["output_filename"], "source_lossless [أنصتوا].wav")
         self.assertEqual(res_wav["mime_type"], "audio/wav")
         self.assertEqual(res_wav["ranges_count"], 2)
         wav_probe_p = self.work_dir / "web_multi.wav"
@@ -982,8 +999,64 @@ class EndToEndPipelineTests(unittest.TestCase):
                 external_url="https://soundcloud.com/qari/surah-qaf",
             )
         mock_dl.assert_called_once()
-        self.assertEqual(res_sc["output_filename"], "sc_mock_clean.m4a")
+        self.assertEqual(res_sc["output_filename"], "sc_mock [أنصتوا].m4a")
         self.assertEqual(res_sc["quality"], "192")
+
+    def test_universal_vintage_overlap_cluster_murmur_and_dynamic_pad_end(self) -> None:
+        """Verify <=-50dBFS vintage/live gets 300ms overlap, 750/950ms dynamic pad_end, and cluster murmur rules."""
+        sr = 16000
+        rng = np.random.default_rng(99)
+
+        def _add_harm(buf: np.ndarray, t0: float, dur: float, amp: float) -> None:
+            s0 = int(round(t0 * sr))
+            n = int(round(dur * sr))
+            t = np.arange(n, dtype=np.float64) / sr
+            mod = 0.70 + 0.30 * np.sin(2.0 * np.pi * 3.0 * t)
+            sig = (
+                0.55 * np.sin(2.0 * np.pi * 170.0 * t)
+                + 0.30 * np.sin(2.0 * np.pi * 340.0 * t)
+                + 0.15 * np.sin(2.0 * np.pi * 510.0 * t)
+            ) * mod
+            buf[s0 : s0 + n] += sig * (amp / float(np.sqrt(np.mean(sig * sig) + 1e-12)))
+
+        # Timeline (~56.5s total) with -52 dBFS vintage floor (<= -50 dBFS like Hud/Yunus/An'am):
+        #  1.0..9.0s: Loud Verse 1 ending (-8 dBFS >= reciter_p75 -> gets 950ms pad_end!)
+        # 11.5..13.5s + 14.6..16.7s: 2-burst crowd murmur cluster (each >= 2.0s past unconfirmed-blip filter,
+        #                          1.1s < 1.8s link, span 5.2s <= 12s, -24.5 dBFS, gaps >= 2.5s -> STRIPPED as 2 bursts)
+        # 19.2..27.2s: Moderate Verse 2 ending (-11 dBFS < reciter_p75 -> gets 750ms pad_end!)
+        # 29.4..44.2s: Sustained soft recitation (> 12s: three 4.2s phrases with 1.1s gaps = 14.8s at -24.5 dBFS -> KEPT!)
+        # 46.4..54.4s: Loud Verse 3 (-8 dBFS)
+        arr = rng.normal(0.0, 10.0 ** (-52.0 / 20.0), int(56.5 * sr))
+        _add_harm(arr, 1.0, 7.0, 10.0 ** (-8.5 / 20.0))
+        _add_harm(arr, 8.0, 1.0, 10.0 ** (-6.0 / 20.0))
+        _add_harm(arr, 11.5, 2.0, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 14.6, 2.1, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 19.2, 8.0, 10.0 ** (-11.0 / 20.0))
+        _add_harm(arr, 29.4, 4.2, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 34.7, 4.2, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 40.0, 4.2, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 46.4, 8.0, 10.0 ** (-8.0 / 20.0))
+
+        res = detect_speech_segments(arr.astype(np.float32), VADConfig(mode="natural"), exact_duration=56.5)
+        self.assertEqual(res.profile.kind, "vintage/live")
+        self.assertLessEqual(res.profile.noise_floor_p5_db, -50.0)
+        self.assertEqual(res.resolved_pad_start_ms, 350)
+        self.assertEqual(res.resolved_pad_end_ms, 750)
+        self.assertEqual(res.resolved_min_silence_ms, 900)
+        self.assertEqual(res.resolved_crossfade_ms, 300)
+        self.assertEqual(res.resolved_gap_ms, 0)
+        self.assertTrue(res.direct_overlap)
+        self.assertEqual(res.stray_shouts_stripped, 2)
+
+        # Murmur cluster [11.5..16.7] stripped; soft >12s recitation [29.4..44.2] preserved!
+        self.assertFalse(any(s.start <= 14.0 <= s.end for s in res.segments))
+        self.assertTrue(any(s.start <= 36.0 <= s.end for s in res.segments))
+
+        # Loud ending (Verse 1 ending at ~9.0s) gets ~950ms pad_end (~9.95s), moderate Verse 2 (~27.2s) gets ~750ms (~27.95s)
+        seg_v1 = next(s for s in res.segments if s.start <= 1.2 <= s.end)
+        seg_v2 = next(s for s in res.segments if s.start <= 20.0 <= s.end)
+        self.assertGreaterEqual(seg_v1.end, 9.85)
+        self.assertLess(seg_v2.end, 28.05)
 
     def test_web_app_ui_smoke(self) -> None:
         from streamlit.testing.v1 import AppTest

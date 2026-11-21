@@ -5,13 +5,10 @@ A fast, modular Python CLI and bilingual (Arabic-first RTL / English) Streamlit 
 ## Features & Architecture
 
 - **Dual-Rate Zero-Loss Pipeline**: Decodes a temporary 16kHz mono stream (with an 80Hz high-pass filter for VAD analysis only) for hybrid Silero VAD + vocal-band energy detection, then maps exact timestamps back to slice and concatenate the **original high-sample-rate audio/video stream** (`soundfile` for `.wav -> .wav`, streaming FFmpeg for `.mp3`, `.m4a`, `.mp4`, `.mkv`, `.webm`, `.opus`, `.flac`).
-- **Auto-Profiler & Data-Driven Vintage Smoothing**:
-  - Automatically classifies clean **Studio** recordings (rejecting close-mic inhalation breaths via high-frequency spectral balance and relaxing sustain down to `p90 - 26 dB` so soft 1960s studio passages stay intact) vs. **Vintage / Live** hall recordings.
-  - Adapts silence thresholds, splice crossfades, breathing gaps, and isolated stray-shout filtering directly from measured noise floor (`p5`) and SNR:
-    - **High ambient / crowd noise** (`floor > -30 dBFS` or `SNR < 18 dB`): `1250ms` min silence, `550ms` gap, `65ms` crossfade, and filters isolated `< 2.5s` stray audience shouts in long pauses while keeping immediate post-verse reactions.
-    - **Moderate vintage** (`-50 < floor <= -30 dBFS` and `SNR >= 18 dB`): `900ms` min silence, `500ms` gap, `65ms` crossfade.
-    - **Studio / quiet floor** (`floor <= -50 dBFS`): `700ms` min silence, `450ms` digital silence gap, `20ms` crossfade.
-  - **Room-Tone Bridge**: When `floor > -50 dBFS`, bridges gaps using authentic low-level ambient floor samples (`p5–p15`) instead of digital silence holes.
+- **Auto-Profiler & Universal Vintage Reverb Overlap**:
+  - Automatically classifies clean **Studio** recordings (rejecting close-mic inhalation breaths via high-frequency spectral balance and relaxing sustain down to `p90 - 26 dB` so soft 1960s studio passages stay intact, using `700ms` min silence / `450ms` digital silence gap / `20ms` crossfade) vs. **Vintage / Live** hall recordings.
+  - On **all `vintage/live`** recordings, extends padding (`350ms` before speech, `750ms` after speech or `950ms` when ending `core_db >= reciter_p75`) to capture real decaying mosque reverb and pre-breath ambience, overlapping adjacent segments directly with a `300ms` equal-power (sin/cos) crossfade (`gap = 0`) plus a gentle `150ms` start fade-in and `500ms` end fade-out.
+  - **Universal Adaptive Cluster Crowd & Murmur Filter (`natural` mode)**: Computes an SNR-scaled margin (`margin_db = max(4.2, min(11.0, snr_db * 0.32))`), groups consecutive bursts separated by `< 1.8s` up to `12.0s` total span, and strips only bursts/clusters isolated inside pauses (`gap_before >= 1.5s` and `gap_after >= 1.8s`) well below reciter core level while keeping continuous soft recitation intact.
 - **Modes, Multi-Range Clipping & Quality Selection**:
   - `natural` *(default)*: Auto-profiled hybrid Silero VAD (`--threshold 0.20`) + energy gate — preserves soft endings, Maqam sustain, and natural live crowd reactions.
   - `prayer`: Detects periodic Ruku/Sujud windows (`>= 12s`) and Muballigh echo clusters (`<= 10.8s` bursts inside `14s–65s` spans), stripping opening and transition Takbirs while strictly preserving Al-Fatihah and Short Surahs.

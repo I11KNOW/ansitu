@@ -262,7 +262,7 @@ def run_cleaning_job(
             )
             range_jobs.append((start_s, clip_end if end_s is not None else None, vad_result))
 
-        out_filename = f"{source_stem}_clean.{eff_fmt}"
+        out_filename = f"{source_stem} [أنصتوا].{eff_fmt}"
         output_path = work_dir / out_filename
         timestamps_path = work_dir / "timestamps.json"
 
@@ -308,6 +308,7 @@ def run_cleaning_job(
             "prayer_segments_stripped": sum(vr.prayer_stripped_count for _, _, vr in range_jobs),
             "stray_shouts_stripped": sum(vr.stray_shouts_stripped for _, _, vr in range_jobs),
             "room_tone_bridge": any(vr.use_room_tone for _, _, vr in range_jobs),
+            "direct_overlap": any(vr.direct_overlap for _, _, vr in range_jobs),
         }
 
 
@@ -361,6 +362,17 @@ def _inject_styles() -> None:
             opacity: 0.72;
             margin-top: 0.2rem;
         }
+        .trust-footer {
+            direction: rtl;
+            text-align: center;
+            font-size: 0.86rem;
+            line-height: 1.65;
+            padding: 0.95rem 1.2rem;
+            border-radius: 12px;
+            border: 1px solid rgba(15, 118, 110, 0.22);
+            background: rgba(15, 118, 110, 0.05);
+            opacity: 0.92;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -382,7 +394,12 @@ def _render_metrics_card(res: dict[str, Any]) -> None:
         if ranges_cnt > 1
         else f"{res['segments_kept']} مقاطع | segments"
     )
-    bridge_lbl = " · Room-Tone" if res.get("room_tone_bridge") else ""
+    if res.get("direct_overlap"):
+        bridge_lbl = " · Natural Overlap"
+    elif res.get("room_tone_bridge"):
+        bridge_lbl = " · Room-Tone"
+    else:
+        bridge_lbl = ""
 
     cards = [
         (c1, "المدة الأصلية | Original Duration", orig_str, f"{res['original_duration']:.1f}s"),
@@ -625,6 +642,17 @@ def main() -> None:
 
         with st.expander(f"📋 تفاصيل المقاطع المحتفظ بها ({res['segments_kept']}) | Kept Segments"):
             st.dataframe(res["segments"], width="stretch", hide_index=True)
+
+    st.divider()
+    st.markdown(
+        """
+        <div class="trust-footer">
+            🛡️ <strong>أنصتوا — Ansitu</strong> يعتمد على معالجة إشارة رقمية نقية 100% (Zero-AI DSP) دون أي تدخل من الذكاء الاصطناعي أو تغيير في نبرة القارئ أو سرعته أو مقاماته، ويتم مسح جميع الملفات المؤقتة تلقائياً فور انتهاء المعالجة.<br>
+            <span>Pure Zero-AI DSP — original reciter tone, pitch, speed, and analog warmth are never altered, and all temporary files are cleared automatically.</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
