@@ -1,4 +1,4 @@
-"""Hybrid Silero VAD + auto-profiler, studio breath filter, crowd/murmur cluster filter, and strict calibration."""
+"""Hybrid Silero VAD + auto-profiler, low-SNR safety gate, studio breath filter, and crowd murmur cluster filter."""
 
 from __future__ import annotations
 
@@ -9,29 +9,27 @@ import numpy as np
 
 from .media import VAD_SAMPLE_RATE
 
-Mode = Literal["natural", "strict"]
 ProfileType = Literal["studio", "vintage/live"]
 
 _FRAME_SAMPLES = 512  # 32ms windows at 16kHz (matches Silero VAD windowing)
 _MIN_SPEECH_MS = 200
 _STUDIO_MIN_SPEECH_MS = 220
-_ENERGY_BRIDGE_MS = 250
 _VAD_CHUNK_SECONDS = 60
 _VAD_OVERLAP_SECONDS = 2
+_LOW_SNR_GUARD_DB = 12.0
+_MIN_VINTAGE_EFFECTIVE_CUT_S = 1.2
 
 
 @dataclass(frozen=True)
 class VADConfig:
     """Configuration for hybrid Silero VAD, auto-profiling, padding, and gaps."""
 
-    mode: Mode = "natural"
     threshold: float = 0.20
     pad_start_ms: Optional[int] = None
     pad_end_ms: Optional[int] = None
     min_silence_ms: Optional[int] = None
     crossfade_ms: Optional[int] = None
     gap_ms: Optional[int] = None
-    strict_margin_db: float = 12.0
 
 
 @dataclass(frozen=True)
@@ -66,9 +64,6 @@ class VADResult:
     segments: list[Segment]
     total_duration: float
     profile: AudioProfile
-    speech_p25_db: Optional[float]
-    reciter_median_db: Optional[float]
-    strict_cutoff_db: Optional[float]
     raw_segments_count: int
     filtered_segments_count: int
     quietest_gap_window: Optional[tuple[float, float, float]] = None
@@ -79,6 +74,7 @@ class VADResult:
     resolved_gap_ms: int = 450
     use_room_tone: bool = False
     direct_overlap: bool = False
+    low_snr_guarded: bool = False
     stray_shouts_stripped: int = 0
 
 
@@ -175,20 +171,6 @@ def _merge_intervals(
     return merged
 
 
-def _bridge_close_segments(segments: list[Segment], min_gap_s: float) -> list[Segment]:
-    """Merge adjacent segments whose silence gap is strictly shorter than min_gap_s."""
-    if not segments:
-        return []
-    merged: list[Segment] = [segments[0]]
-    for seg in segments[1:]:
-        prev = merged[-1]
-        if seg.start - prev.end < min_gap_s:
-            merged[-1] = Segment(start=prev.start, end=max(prev.end, seg.end))
-        else:
-            merged.append(seg)
-    return merged
-
-
 def _apply_padding_and_merge(
     segments: list[Segment],
     pad_start_s: float,
@@ -196,8 +178,9 @@ def _apply_padding_and_merge(
     min_bound: float,
     max_bound: float,
     min_splice_gap_s: float,
+    min_effective_cut_s: float = 0.0,
 ) -> list[Segment]:
-    """Apply asymmetric start/end padding and merge overlapping or sub-crossfade gaps."""
+    """Apply asymmetric start/end padding and merge sub-crossfade or sub-threshold gaps."""
     if not segments:
         return []
 
@@ -214,7 +197,10 @@ def _apply_padding_and_merge(
     merged: list[Segment] = [padded[0]]
     for seg in padded[1:]:
         prev = merged[-1]
-        if seg.start - prev.end <= min_splice_gap_s:
+        gap_between = seg.start - prev.end
+        if gap_between <= min_splice_gap_s or (
+            min_effective_cut_s > 0.0 and gap_between < min_effective_cut_s
+        ):
             merged[-1] = Segment(start=prev.start, end=max(prev.end, seg.end))
         else:
             merged.append(seg)
@@ -468,14 +454,14 @@ def _filter_crowd_murmur_clusters(
     clip_start_s: float,
     clip_end_s: float,
 ) -> tuple[list[tuple[float, float, float, np.ndarray]], int]:
-    """Strip isolated crowd bursts or <1.8s clusters (<=12s) well below reciter core dB."""
+    """Strip short isolated crowd bursts/clusters (<=3.5s) >=10 dB below reciter core."""
     if len(segs_info) < 3:
         return segs_info, 0
 
     core_vals = np.array([x[2] for x in segs_info], dtype=np.float64)
     durs = np.array([max(0.05, x[1] - x[0]) for x in segs_info], dtype=np.float64)
     reciter_core_med = _weighted_percentile(core_vals, durs, 50.0)
-    margin_db = max(4.2, min(11.0, snr_db * 0.32))
+    margin_db = max(10.0, min(14.0, snr_db * 0.40))
     cutoff_db = reciter_core_med - margin_db
 
     n = len(segs_info)
@@ -506,7 +492,7 @@ def _filter_crowd_murmur_clusters(
             else (segs_info[j + 1][0] - segs_info[j][1])
         )
 
-        if cluster_span <= 12.0 and gap_before >= 1.5 and gap_after >= 1.8:
+        if cluster_span <= 3.5 and gap_before >= 1.5 and gap_after >= 1.8:
             combined_fdbs = np.concatenate([segs_info[k][3] for k in range(idx, j + 1)])
             cluster_core_db = float(np.percentile(combined_fdbs, 75))
             if cluster_core_db <= cutoff_db:
@@ -653,12 +639,13 @@ def _find_quietest_gap_window(
 
 def detect_speech_segments(
     audio_16k: np.ndarray,
-    config: VADConfig,
+    config: Optional[VADConfig] = None,
     exact_duration: Optional[float] = None,
     clip_start_s: float = 0.0,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> VADResult:
     """Detect vocal segments via auto-profiled hybrid Silero VAD + energy gate."""
+    cfg = config if config is not None else VADConfig()
     vad_duration = audio_16k.size / float(VAD_SAMPLE_RATE)
     clip_dur = exact_duration if exact_duration is not None else vad_duration
     clip_end_s = clip_start_s + clip_dur
@@ -666,6 +653,34 @@ def detect_speech_segments(
     analysis_audio = audio_16k.astype(np.float64, copy=False) - float(np.mean(audio_16k))
     frame_dbs = _compute_frame_dbs(analysis_audio)
     profile = _profile_audio(analysis_audio, frame_dbs=frame_dbs)
+
+    if profile.snr_db < _LOW_SNR_GUARD_DB:
+        if progress_cb is not None:
+            progress_cb(1.0)
+        seg_fdbs, overall_db = _segment_frame_dbs(analysis_audio, 0, analysis_audio.size)
+        core_db = float(np.percentile(seg_fdbs, 75))
+        full_seg = Segment(
+            start=round(clip_start_s, 4),
+            end=round(clip_end_s, 4),
+            rms_db=round(overall_db, 2),
+            core_db=round(core_db, 2),
+        )
+        return VADResult(
+            segments=[full_seg],
+            total_duration=clip_dur,
+            profile=profile,
+            raw_segments_count=1,
+            filtered_segments_count=1,
+            resolved_pad_start_ms=0,
+            resolved_pad_end_ms=0,
+            resolved_min_silence_ms=0,
+            resolved_crossfade_ms=0,
+            resolved_gap_ms=0,
+            use_room_tone=False,
+            direct_overlap=False,
+            low_snr_guarded=True,
+            stray_shouts_stripped=0,
+        )
 
     (
         eff_min_sil,
@@ -675,17 +690,13 @@ def detect_speech_segments(
         eff_pad_end,
         direct_overlap,
         use_room_tone,
-    ) = _resolve_profile_params(profile, config)
-    island_bridge_ms = (
-        min(_ENERGY_BRIDGE_MS, eff_min_sil)
-        if config.mode == "strict"
-        else eff_min_sil
-    )
+    ) = _resolve_profile_params(profile, cfg)
+    island_bridge_ms = eff_min_sil
     min_speech_ms = _STUDIO_MIN_SPEECH_MS if profile.kind == "studio" else _MIN_SPEECH_MS
 
     silero_intervals = _run_silero_vad_chunked(
         audio_16k=audio_16k,
-        threshold=config.threshold,
+        threshold=cfg.threshold,
         island_bridge_ms=island_bridge_ms,
         min_speech_ms=min_speech_ms,
         progress_cb=(lambda p: progress_cb(p * 0.90)) if progress_cb is not None else None,
@@ -712,17 +723,13 @@ def detect_speech_segments(
                 eff_pad_end,
                 direct_overlap,
                 use_room_tone,
-            ) = _resolve_profile_params(profile, config)
+            ) = _resolve_profile_params(profile, cfg)
             min_speech_ms = _STUDIO_MIN_SPEECH_MS
-            island_bridge_ms = (
-                min(_ENERGY_BRIDGE_MS, eff_min_sil)
-                if config.mode == "strict"
-                else eff_min_sil
-            )
-            if config.min_silence_ms is None:
+            island_bridge_ms = eff_min_sil
+            if cfg.min_silence_ms is None:
                 silero_intervals = _run_silero_vad_chunked(
                     audio_16k=audio_16k,
-                    threshold=config.threshold,
+                    threshold=cfg.threshold,
                     island_bridge_ms=island_bridge_ms,
                     min_speech_ms=min_speech_ms,
                 )
@@ -752,9 +759,6 @@ def detect_speech_segments(
             segments=[],
             total_duration=clip_dur,
             profile=profile,
-            speech_p25_db=None,
-            reciter_median_db=None,
-            strict_cutoff_db=None,
             raw_segments_count=0,
             filtered_segments_count=0,
             resolved_pad_start_ms=eff_pad_start,
@@ -766,75 +770,44 @@ def detect_speech_segments(
             direct_overlap=direct_overlap,
         )
 
-    speech_p25_db: Optional[float] = None
-    reciter_median_db: Optional[float] = None
-    strict_cutoff_db: Optional[float] = None
     raw_count = len(raw_samples)
     stray_stripped_count = 0
 
-    if config.mode == "strict":
-        island_stats: list[tuple[int, int, float, float]] = []
-        for s_idx, e_idx in raw_samples:
-            seg_fdbs, overall_db = _segment_frame_dbs(analysis_audio, s_idx, e_idx)
-            island_energy_db = float(max(overall_db, float(np.median(seg_fdbs))))
-            island_stats.append((s_idx, e_idx, overall_db, island_energy_db))
-
-        energies = np.array([x[3] for x in island_stats], dtype=np.float64)
-        durations = np.array(
-            [max(1, x[1] - x[0]) / float(VAD_SAMPLE_RATE) for x in island_stats],
-            dtype=np.float64,
+    segs_raw: list[tuple[float, float, float, np.ndarray]] = []
+    for s_idx, e_idx in raw_samples:
+        seg_fdbs, overall_db = _segment_frame_dbs(analysis_audio, s_idx, e_idx)
+        core_db = float(np.percentile(seg_fdbs, 75))
+        segs_raw.append(
+            (
+                clip_start_s + s_idx / float(VAD_SAMPLE_RATE),
+                clip_start_s + e_idx / float(VAD_SAMPLE_RATE),
+                core_db,
+                seg_fdbs,
+            )
         )
-        speech_p25_db = _weighted_percentile(energies, durations, 25.0)
-        reciter_median_db = _weighted_percentile(energies, durations, 50.0)
-        strict_cutoff_db = speech_p25_db - config.strict_margin_db
 
-        kept_islands = [
-            Segment(
-                start=clip_start_s + s_idx / float(VAD_SAMPLE_RATE),
-                end=clip_start_s + e_idx / float(VAD_SAMPLE_RATE),
-                rms_db=overall_db,
-                core_db=island_energy_db,
-            )
-            for s_idx, e_idx, overall_db, island_energy_db in island_stats
-            if island_energy_db >= strict_cutoff_db
-        ]
-        filtered_count = len(kept_islands)
-        bridged = _bridge_close_segments(kept_islands, eff_min_sil / 1000.0)
-    else:
-        segs_raw: list[tuple[float, float, float, np.ndarray]] = []
-        for s_idx, e_idx in raw_samples:
-            seg_fdbs, overall_db = _segment_frame_dbs(analysis_audio, s_idx, e_idx)
-            core_db = float(np.percentile(seg_fdbs, 75))
-            segs_raw.append(
-                (
-                    clip_start_s + s_idx / float(VAD_SAMPLE_RATE),
-                    clip_start_s + e_idx / float(VAD_SAMPLE_RATE),
-                    core_db,
-                    seg_fdbs,
-                )
-            )
+    if profile.kind == "vintage/live":
+        segs_raw, stray_stripped_count = _filter_crowd_murmur_clusters(
+            segs_raw,
+            snr_db=profile.snr_db,
+            clip_start_s=clip_start_s,
+            clip_end_s=clip_end_s,
+        )
 
-        if config.mode == "natural" and profile.kind == "vintage/live":
-            segs_raw, stray_stripped_count = _filter_crowd_murmur_clusters(
-                segs_raw,
-                snr_db=profile.snr_db,
-                clip_start_s=clip_start_s,
-                clip_end_s=clip_end_s,
-            )
-
-        bridged = [Segment(start=s, end=e) for s, e, _, _ in segs_raw]
-        filtered_count = len(bridged)
-        if progress_cb is not None:
-            progress_cb(1.0)
+    bridged = [Segment(start=s, end=e) for s, e, _, _ in segs_raw]
+    filtered_count = len(bridged)
+    if progress_cb is not None:
+        progress_cb(1.0)
 
     pad_ends_s = _compute_segment_pad_ends_s(
         analysis_audio=analysis_audio,
         segments=bridged,
         profile=profile,
-        config=config,
+        config=cfg,
         base_pad_end_ms=eff_pad_end,
         clip_start_s=clip_start_s,
     )
+    min_effective_cut_s = 0.0 if profile.kind == "studio" else _MIN_VINTAGE_EFFECTIVE_CUT_S
     padded = _apply_padding_and_merge(
         bridged,
         pad_start_s=eff_pad_start / 1000.0,
@@ -842,6 +815,7 @@ def detect_speech_segments(
         min_bound=clip_start_s,
         max_bound=clip_end_s,
         min_splice_gap_s=eff_xfade / 1000.0,
+        min_effective_cut_s=min_effective_cut_s,
     )
 
     final_segments: list[Segment] = []
@@ -877,13 +851,6 @@ def detect_speech_segments(
         segments=final_segments,
         total_duration=clip_dur,
         profile=profile,
-        speech_p25_db=round(speech_p25_db, 2) if speech_p25_db is not None else None,
-        reciter_median_db=(
-            round(reciter_median_db, 2) if reciter_median_db is not None else None
-        ),
-        strict_cutoff_db=(
-            round(strict_cutoff_db, 2) if strict_cutoff_db is not None else None
-        ),
         raw_segments_count=raw_count,
         filtered_segments_count=filtered_count,
         quietest_gap_window=quiet_gap,
@@ -894,5 +861,6 @@ def detect_speech_segments(
         resolved_gap_ms=eff_gap,
         use_room_tone=use_room_tone,
         direct_overlap=direct_overlap,
+        low_snr_guarded=False,
         stray_shouts_stripped=stray_stripped_count,
     )

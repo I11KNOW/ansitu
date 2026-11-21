@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quran-trim",
         description=(
-            "Zero-config Quran recitation silence, breath, and murmur gap remover "
+            "Zero-config, ultra-safe Quran recitation silence, breath, and murmur gap remover "
             "using an auto-profiled dual-rate Silero VAD + vocal-band energy pipeline."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -45,16 +45,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to local audio/video file (.mp3, .wav, .m4a, .mp4, .mkv, .webm) "
             "or any external URL supported by yt-dlp (YouTube, SoundCloud, Archive.org, direct audio links)."
-        ),
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["natural", "strict"],
-        default="natural",
-        help=(
-            "natural (default): Auto-profiled studio/vintage pipeline preserving soft "
-            "endings and hall ambience while filtering isolated crowd murmurs; "
-            "strict (advanced): adaptive p25 RMS filter to drop distant crowd shouts."
         ),
     )
     parser.add_argument(
@@ -113,13 +103,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Room-tone/silence breathing gap inserted between segments in ms (auto if omitted).",
     )
     parser.add_argument(
-        "--strict-margin-db",
-        type=float,
-        default=12.0,
-        metavar="DB",
-        help="[Advanced] Strict mode dB margin below the lower-percentile (p25) speech floor.",
-    )
-    parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -160,8 +143,6 @@ def _validate_args(args: argparse.Namespace) -> tuple[Optional[float], Optional[
         raise ValueError("--crossfade must be >= 0 ms.")
     if args.gap_ms is not None and args.gap_ms < 0:
         raise ValueError("--gap-ms must be >= 0 ms.")
-    if args.strict_margin_db < 0:
-        raise ValueError("--strict-margin-db must be >= 0 dB.")
 
     start_s = parse_timestamp(args.start) if args.start is not None else None
     end_s = parse_timestamp(args.end) if args.end is not None else None
@@ -172,7 +153,6 @@ def _validate_args(args: argparse.Namespace) -> tuple[Optional[float], Optional[
 
 def _print_summary(
     result: ProcessResult,
-    mode: str,
     gap_ms: int,
     vad_result: VADResult,
     clip_start_s: Optional[float],
@@ -182,7 +162,7 @@ def _print_summary(
     print()
     print("Quran Recitation Cleanup Summary")
     print("-" * 48)
-    print(f"Mode                : {mode}")
+    print("Mode                : auto (ultra-safe)")
     print(
         f"Detected Profile    : {prof.kind} "
         f"(floor p5: {prof.noise_floor_p5_db:.1f} dBFS, SNR: {prof.snr_db:.1f} dB)"
@@ -191,28 +171,26 @@ def _print_summary(
         s_lbl = _format_duration(clip_start_s or 0.0).split(" (")[0]
         e_lbl = _format_duration(clip_end_s or vad_result.total_duration).split(" (")[0]
         print(f"Clip Range          : {s_lbl} -> {e_lbl}")
-    if vad_result.direct_overlap:
-        gap_kind = "direct reverb overlap"
-    elif vad_result.use_room_tone:
-        gap_kind = "room-tone bridge"
+    if vad_result.low_snr_guarded:
+        print("Adaptive Tuning     : paused (Low-SNR Safety Gate: SNR < 12.0 dB)")
+        print(
+            "Safety Notice       : تم إيقاف قصّ السكتات تلقائياً لحماية الحروف القرآنية من الضوضاء المرتفعة | "
+            "Automatic silence removal was paused to protect Quranic letters from heavy background noise."
+        )
     else:
-        gap_kind = "digital silence"
-    print(
-        f"Adaptive Tuning     : min-silence {vad_result.resolved_min_silence_ms} ms, "
-        f"pad {vad_result.resolved_pad_start_ms}/{vad_result.resolved_pad_end_ms} ms, "
-        f"gap {gap_ms} ms ({gap_kind}), xfade {vad_result.resolved_crossfade_ms} ms"
-    )
+        if vad_result.direct_overlap:
+            gap_kind = "direct reverb overlap"
+        elif vad_result.use_room_tone:
+            gap_kind = "room-tone bridge"
+        else:
+            gap_kind = "digital silence"
+        print(
+            f"Adaptive Tuning     : min-silence {vad_result.resolved_min_silence_ms} ms, "
+            f"pad {vad_result.resolved_pad_start_ms}/{vad_result.resolved_pad_end_ms} ms, "
+            f"gap {gap_ms} ms ({gap_kind}), xfade {vad_result.resolved_crossfade_ms} ms"
+        )
     if vad_result.stray_shouts_stripped > 0:
         print(f"Crowd Filtering     : {vad_result.stray_shouts_stripped} isolated background murmur/shout segments stripped")
-    if (
-        mode == "strict"
-        and vad_result.reciter_median_db is not None
-        and vad_result.strict_cutoff_db is not None
-    ):
-        if vad_result.speech_p25_db is not None:
-            print(f"Speech Floor (p25)  : {vad_result.speech_p25_db:.2f} dBFS")
-        print(f"Reciter Median RMS  : {vad_result.reciter_median_db:.2f} dBFS")
-        print(f"Strict Cutoff       : {vad_result.strict_cutoff_db:.2f} dBFS")
     print(f"Original Duration   : {_format_duration(result.original_duration)}")
     print(f"Final Duration      : {_format_duration(result.final_duration)}")
     print(f"Time Saved (%)      : {result.time_saved_pct:.2f}%")
@@ -223,6 +201,11 @@ def _print_summary(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -276,14 +259,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
         config = VADConfig(
-            mode=args.mode,
             threshold=args.threshold,
             pad_start_ms=args.pad_start,
             pad_end_ms=args.pad_end,
             min_silence_ms=args.min_silence,
             crossfade_ms=args.crossfade,
             gap_ms=args.gap_ms,
-            strict_margin_db=args.strict_margin_db,
         )
         vad_result = detect_speech_segments(
             audio_16k=audio_16k,
@@ -292,10 +273,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             clip_start_s=clip_start,
         )
 
-        print(
-            f"Slicing original stream ({len(vad_result.segments)} segments, "
-            f"{vad_result.resolved_crossfade_ms}ms crossfade, {vad_result.resolved_gap_ms}ms gap)..."
-        )
+        if vad_result.low_snr_guarded:
+            print(
+                f"Low-SNR Safety Gate triggered (SNR {vad_result.profile.snr_db:.1f} dB < 12.0 dB): "
+                "preserving audio untouched..."
+            )
+        else:
+            print(
+                f"Slicing original stream ({len(vad_result.segments)} segments, "
+                f"{vad_result.resolved_crossfade_ms}ms crossfade, {vad_result.resolved_gap_ms}ms gap)..."
+            )
         result = render_clean_media(
             input_path=input_path,
             output_path=output_path,
@@ -308,7 +295,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         _print_summary(
             result=result,
-            mode=args.mode,
             gap_ms=vad_result.resolved_gap_ms,
             vad_result=vad_result,
             clip_start_s=start_s,

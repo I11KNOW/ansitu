@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -55,6 +56,7 @@ class ProcessResult:
     time_saved_pct: float
     segments_kept: int
     segments: list[Segment]
+    low_snr_guarded: bool = False
 
 
 def _format_timecode(seconds: float) -> str:
@@ -457,6 +459,7 @@ def _process_wav_soundfile(
     info: MediaInfo,
     crossfade_ms: int,
     progress_cb: Optional[Callable[[float], None]] = None,
+    fade_edges: bool = True,
 ) -> float:
     """Slice and crossfade one or more WAV segment groups via soundfile without re-encoding."""
     with sf.SoundFile(str(input_path), mode="r") as sf_in:
@@ -494,8 +497,8 @@ def _process_wav_soundfile(
                 channels=channels,
                 crossfade_ms=crossfade_ms,
                 write_fn=_write,
-                fade_start_edge=True,
-                fade_end_edge=True,
+                fade_start_edge=fade_edges,
+                fade_end_edge=fade_edges,
             )
 
             total_items = float(len(items))
@@ -719,13 +722,12 @@ def _encode_stream_items(
     output_path: Path,
     est_total_frames: int,
     progress_cb: Optional[Callable[[float], None]] = None,
+    fade_edges: bool = True,
 ) -> float:
     """Decode one or more monotonic sample runs, crossfade + bridge in numpy, pipe once to encoder."""
     ffmpeg_bin, _ = require_ffmpeg()
     sr = info.sample_rate
     channels = info.channels
-    fade_start = True
-    fade_end = True
 
     enc_cmd = [
         ffmpeg_bin,
@@ -764,8 +766,8 @@ def _encode_stream_items(
             channels=channels,
             crossfade_ms=crossfade_ms,
             write_fn=_write_pcm,
-            fade_start_edge=fade_start,
-            fade_end_edge=fade_end,
+            fade_start_edge=fade_edges,
+            fade_end_edge=fade_edges,
         )
 
         try:
@@ -807,6 +809,7 @@ def _process_compressed_audio(
     crossfade_ms: int,
     bitrate_kbps: Optional[int] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
+    fade_edges: bool = True,
 ) -> float:
     """Process compressed audio (.mp3, .m4a, .webm, etc.) preserving sample rate and tags."""
     ext = output_path.suffix.lower()
@@ -847,6 +850,7 @@ def _process_compressed_audio(
         output_path=output_path,
         est_total_frames=est_total_frames,
         progress_cb=progress_cb,
+        fade_edges=fade_edges,
     )
 
 
@@ -922,6 +926,7 @@ def _process_video(
     crossfade_ms: int,
     gap_ms: int,
     bitrate_kbps: Optional[int] = None,
+    fade_edges: bool = True,
 ) -> tuple[float, list[Segment]]:
     """Slice video via frame-exact yuv4mpegpipe stream, hold gap frames, mux crossfaded audio."""
     ffmpeg_bin, _ = require_ffmpeg()
@@ -1123,6 +1128,7 @@ def _process_video(
             encoder_cmd_tail=mux_tail,
             output_path=output_path,
             est_total_frames=est_total_frames,
+            fade_edges=fade_edges,
         )
 
         rounded_segments = [
@@ -1152,6 +1158,8 @@ def write_timestamps_json(
     stray_shouts_stripped: Optional[int] = None,
     bitrate_kbps: Optional[int] = None,
     range_summaries: Optional[list[dict[str, object]]] = None,
+    low_snr_guarded: Optional[bool] = None,
+    fade_edges: Optional[bool] = None,
 ) -> None:
     """Write a structured JSON log of all kept segments, profile info, and stats."""
     original = original_duration if original_duration is not None else vad_result.total_duration
@@ -1162,11 +1170,13 @@ def write_timestamps_json(
         if stray_shouts_stripped is not None
         else vad_result.stray_shouts_stripped
     )
+    guarded = vad_result.low_snr_guarded if low_snr_guarded is None else bool(low_snr_guarded)
+    eff_fade_edges = (not guarded) if fade_edges is None else bool(fade_edges)
 
     payload: dict[str, object] = {
         "input_file": str(input_path),
         "output_file": str(output_path),
-        "mode": config.mode,
+        "mode": "auto",
         "profile": {
             "detected": vad_result.profile.kind,
             "noise_floor_p5_db": vad_result.profile.noise_floor_p5_db,
@@ -1183,10 +1193,9 @@ def write_timestamps_json(
             "gap_ms": vad_result.resolved_gap_ms,
             "direct_reverb_overlap": vad_result.direct_overlap,
             "room_tone_bridge": vad_result.use_room_tone,
-            "edge_fade_in_ms": _EDGE_FADE_IN_MS,
-            "edge_fade_out_ms": _EDGE_FADE_OUT_MS,
+            "edge_fade_in_ms": _EDGE_FADE_IN_MS if eff_fade_edges else 0,
+            "edge_fade_out_ms": _EDGE_FADE_OUT_MS if eff_fade_edges else 0,
             "bitrate_kbps": bitrate_kbps,
-            "strict_margin_db": config.strict_margin_db if config.mode == "strict" else None,
             "clip_start_s": round(clip_start_s, 4) if clip_start_s is not None else None,
             "clip_end_s": round(clip_end_s, 4) if clip_end_s is not None else None,
         },
@@ -1197,6 +1206,7 @@ def write_timestamps_json(
             "time_saved_s": round(saved_s, 4),
             "time_saved_pct": round(saved_pct, 2),
             "segments_kept": len(final_segments),
+            "low_snr_guarded": guarded,
             "stray_shouts_stripped": s_stripped,
         },
         "segments": [
@@ -1215,14 +1225,6 @@ def write_timestamps_json(
     }
     if range_summaries is not None:
         payload["ranges"] = range_summaries
-    if config.mode == "strict":
-        payload["calibration"] = {
-            "speech_p25_db": vad_result.speech_p25_db,
-            "reciter_median_db": vad_result.reciter_median_db,
-            "strict_cutoff_db": vad_result.strict_cutoff_db,
-            "raw_speech_islands": vad_result.raw_segments_count,
-            "kept_speech_islands": vad_result.filtered_segments_count,
-        }
 
     timestamps_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -1246,7 +1248,7 @@ def render_clean_media(
     if not vad_result.segments:
         raise RuntimeError(
             "No speech segments were detected above the configured thresholds. "
-            "Try lowering --threshold or switching to --mode natural."
+            "Try lowering --threshold."
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1257,9 +1259,22 @@ def render_clean_media(
     out_ext = output_path.suffix.lower()
     eff_crossfade_ms = vad_result.resolved_crossfade_ms
     eff_gap_ms = vad_result.resolved_gap_ms
+    fade_edges = not vad_result.low_snr_guarded
+    use_direct_copy = (
+        vad_result.low_snr_guarded
+        and clip_start_s is None
+        and clip_end_s is None
+        and input_path.suffix.lower() == out_ext
+        and bitrate_kbps is None
+    )
 
     try:
-        if info.has_video and out_ext not in _AUDIO_ONLY_EXTENSIONS:
+        if use_direct_copy:
+            shutil.copyfile(input_path, tmp_output)
+            final_duration = info.duration
+            if progress_cb is not None:
+                progress_cb(1.0)
+        elif info.has_video and out_ext not in _AUDIO_ONLY_EXTENSIONS:
             final_duration, final_segments = _process_video(
                 input_path=input_path,
                 output_path=tmp_output,
@@ -1269,6 +1284,7 @@ def render_clean_media(
                 crossfade_ms=eff_crossfade_ms,
                 gap_ms=eff_gap_ms,
                 bitrate_kbps=bitrate_kbps,
+                fade_edges=fade_edges,
             )
             if progress_cb is not None:
                 progress_cb(1.0)
@@ -1280,6 +1296,7 @@ def render_clean_media(
                 info=info,
                 crossfade_ms=eff_crossfade_ms,
                 progress_cb=progress_cb,
+                fade_edges=fade_edges,
             )
         else:
             final_duration = _process_compressed_audio(
@@ -1290,6 +1307,7 @@ def render_clean_media(
                 crossfade_ms=eff_crossfade_ms,
                 bitrate_kbps=bitrate_kbps,
                 progress_cb=progress_cb,
+                fade_edges=fade_edges,
             )
 
         os.replace(tmp_output, output_path)
@@ -1310,6 +1328,8 @@ def render_clean_media(
         clip_start_s=clip_start_s,
         clip_end_s=clip_end_s,
         bitrate_kbps=bitrate_kbps,
+        low_snr_guarded=vad_result.low_snr_guarded,
+        fade_edges=fade_edges,
     )
 
     original = vad_result.total_duration
@@ -1324,6 +1344,7 @@ def render_clean_media(
         time_saved_pct=saved_pct,
         segments_kept=len(final_segments),
         segments=final_segments,
+        low_snr_guarded=vad_result.low_snr_guarded,
     )
 
 
@@ -1370,6 +1391,8 @@ def render_clean_ranges(
     timestamps_path.parent.mkdir(parents=True, exist_ok=True)
 
     range_results = [vr for _, _, vr in range_jobs]
+    any_guarded = any(vr.low_snr_guarded for vr in range_results)
+    fade_edges = not all(vr.low_snr_guarded for vr in range_results)
     eff_crossfade_ms = max(vr.resolved_crossfade_ms for vr in range_results)
     tmp_output = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
 
@@ -1382,6 +1405,7 @@ def render_clean_ranges(
                 info=info,
                 crossfade_ms=eff_crossfade_ms,
                 progress_cb=progress_cb,
+                fade_edges=fade_edges,
             )
         else:
             final_duration = _process_compressed_audio(
@@ -1392,6 +1416,7 @@ def render_clean_ranges(
                 crossfade_ms=eff_crossfade_ms,
                 bitrate_kbps=bitrate_kbps,
                 progress_cb=progress_cb,
+                fade_edges=fade_edges,
             )
 
         os.replace(tmp_output, output_path)
@@ -1411,6 +1436,7 @@ def render_clean_ranges(
             "end_s": round(e, 4) if e is not None else round(info.duration, 4),
             "duration_s": round(vr.total_duration, 4),
             "segments_kept": len(vr.segments),
+            "low_snr_guarded": vr.low_snr_guarded,
             "gap_ms": vr.resolved_gap_ms,
             "crossfade_ms": vr.resolved_crossfade_ms,
             "min_silence_ms": vr.resolved_min_silence_ms,
@@ -1433,6 +1459,8 @@ def render_clean_ranges(
         stray_shouts_stripped=sum(vr.stray_shouts_stripped for vr in range_results),
         bitrate_kbps=bitrate_kbps,
         range_summaries=range_summaries,
+        low_snr_guarded=any_guarded,
+        fade_edges=fade_edges,
     )
 
     return ProcessResult(
@@ -1444,4 +1472,5 @@ def render_clean_ranges(
         time_saved_pct=saved_pct,
         segments_kept=len(final_segments),
         segments=final_segments,
+        low_snr_guarded=any_guarded,
     )

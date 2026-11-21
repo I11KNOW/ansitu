@@ -128,7 +128,6 @@ format_youtube_error = format_external_url_error
 
 def run_cleaning_job(
     *,
-    mode: str = "natural",
     start_text: str = "",
     end_text: str = "",
     ranges: Optional[Sequence[tuple[str, str]]] = None,
@@ -144,9 +143,6 @@ def run_cleaning_job(
     def _report(pct: int, msg: str) -> None:
         if progress_cb is not None:
             progress_cb(max(0, min(100, pct)), msg)
-
-    if mode not in {"natural", "strict"}:
-        raise ValueError(f"Unsupported mode: {mode}")
 
     src_url = external_url if external_url is not None else youtube_url
 
@@ -212,7 +208,7 @@ def run_cleaning_job(
 
         _report(22, "جاري فحص خصائص الصوت... | Probing audio properties...")
         info = probe_media(input_path)
-        config = VADConfig(mode=mode)  # type: ignore[arg-type]
+        config = VADConfig()
 
         range_jobs: list[tuple[Optional[float], Optional[float], VADResult]] = []
         n_ranges = len(parsed_ranges)
@@ -291,7 +287,7 @@ def run_cleaning_job(
             "mime_type": _MIME_TYPES[eff_fmt],
             "timestamps_json": ts_text,
             "segments": ts_data.get("segments", []),
-            "mode": mode,
+            "mode": "auto",
             "quality": quality,
             "bitrate_kbps": bitrate_kbps,
             "ranges_count": len(range_jobs),
@@ -302,6 +298,7 @@ def run_cleaning_job(
             "profile_kind": primary_vad.profile.kind,
             "noise_floor_p5_db": primary_vad.profile.noise_floor_p5_db,
             "snr_db": primary_vad.profile.snr_db,
+            "low_snr_guarded": any(vr.low_snr_guarded for _, _, vr in range_jobs),
             "stray_shouts_stripped": sum(vr.stray_shouts_stripped for _, _, vr in range_jobs),
             "room_tone_bridge": any(vr.use_room_tone for _, _, vr in range_jobs),
             "direct_overlap": any(vr.direct_overlap for _, _, vr in range_jobs),
@@ -376,6 +373,13 @@ def _inject_styles() -> None:
 
 
 def _render_metrics_card(res: dict[str, Any]) -> None:
+    if res.get("low_snr_guarded"):
+        st.warning(
+            "⚠️ **حماية الحروف القرآنية مفعّلة (بسبب ارتفاع الضوضاء SNR < 12 dB):** "
+            "تم إيقاف قصّ السكتات تلقائياً والإبقاء على التلاوة كاملةً دون أي حذف لحماية الحروف القرآنية والمدود من الضوضاء المرتفعة في الخلفية.\n\n"
+            "**Low-SNR Safety Gate Active (SNR < 12.0 dB):** Automatic silence removal was paused to protect "
+            "Quranic letters from heavy background noise; full audio was preserved untouched."
+        )
     st.markdown("#### 📊 ملخص النتائج | Results Summary")
     c1, c2, c3, c4 = st.columns(4)
 
@@ -390,7 +394,9 @@ def _render_metrics_card(res: dict[str, Any]) -> None:
         if ranges_cnt > 1
         else f"{res['segments_kept']} مقاطع | segments"
     )
-    if res.get("direct_overlap"):
+    if res.get("low_snr_guarded"):
+        bridge_lbl = " · Safety Gate (<12 dB)"
+    elif res.get("direct_overlap"):
         bridge_lbl = " · Natural Overlap"
     elif res.get("room_tone_bridge"):
         bridge_lbl = " · Room-Tone"
@@ -428,7 +434,13 @@ def _execute_with_progress(**job_kwargs: Any) -> None:
     try:
         res = run_cleaning_job(**job_kwargs, progress_cb=_on_progress)
         st.session_state["quran_clean_result"] = res
-        status_box.success("✅ تمت تنقية التلاوة بنجاح | Recitation cleaned successfully!")
+        if res.get("low_snr_guarded"):
+            status_box.warning(
+                "⚠️ تم إيقاف قصّ السكتات تلقائياً لحماية الحروف القرآنية من الضوضاء المرتفعة | "
+                "Automatic silence removal was paused to protect Quranic letters from heavy background noise."
+            )
+        else:
+            status_box.success("✅ تمت تنقية التلاوة بنجاح | Recitation cleaned successfully!")
     except Exception as exc:
         progress_bar.empty()
         status_box.empty()
@@ -567,7 +579,6 @@ def main() -> None:
         ):
             assert uploaded is not None
             _execute_with_progress(
-                mode="natural",
                 ranges=selected_ranges,
                 out_format=out_format,
                 quality=quality,
@@ -583,7 +594,6 @@ def main() -> None:
             key="run_external_btn",
         ):
             _execute_with_progress(
-                mode="natural",
                 ranges=selected_ranges,
                 out_format=out_format,
                 quality="192" if quality == "lossless_wav" else quality,

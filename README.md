@@ -5,13 +5,13 @@ A fast, modular Python CLI and bilingual (Arabic-first RTL / English) Streamlit 
 ## Features & Architecture
 
 - **Dual-Rate Zero-Loss Pipeline**: Decodes a temporary 16kHz mono stream (with an 80Hz high-pass filter for VAD analysis only) for hybrid Silero VAD + vocal-band energy detection, then maps exact timestamps back to slice and concatenate the **original high-sample-rate audio/video stream** (`soundfile` for `.wav -> .wav`, streaming FFmpeg for `.mp3`, `.m4a`, `.mp4`, `.mkv`, `.webm`, `.opus`, `.flac`).
-- **Auto-Profiler & Universal Vintage Reverb Overlap**:
-  - Automatically classifies clean **Studio** recordings (rejecting close-mic inhalation breaths via high-frequency spectral balance and relaxing sustain down to `p90 - 26 dB` so soft 1960s studio passages stay intact, using `700ms` min silence / `450ms` digital silence gap / `20ms` crossfade) vs. **Vintage / Live** hall recordings.
-  - On **all `vintage/live`** recordings, uses a calm Mujawwad breathing cadence (`650ms` before speech, `1100ms` after speech or `1300ms` when ending `core_db >= reciter_p75`) to capture real decaying mosque reverb and pre-breath hall ambience, overlapping adjacent segments directly with a `400ms` equal-power (sin/cos) crossfade (`gap = 0`, yielding `~1.35s`–`1.55s` natural pause) plus a gentle `150ms` start fade-in and `500ms` end fade-out.
-  - **Universal Adaptive Cluster Crowd & Murmur Filter (`natural` mode)**: Computes an SNR-scaled margin (`margin_db = max(4.2, min(11.0, snr_db * 0.32))`), groups consecutive bursts separated by `< 1.8s` up to `12.0s` total span, and strips only bursts/clusters isolated inside pauses (`gap_before >= 1.5s` and `gap_after >= 1.8s`) well below reciter core level while keeping continuous soft recitation intact.
-- **Modes, Multi-Range Clipping & Quality Selection**:
-  - `natural` *(default)*: Auto-profiled hybrid Silero VAD (`--threshold 0.20`) + energy gate — preserves soft endings, Maqam sustain, and natural live crowd reactions.
-  - `strict` *(advanced)*: Filters segments against an adaptive RMS cutoff anchored to the duration-weighted `p25` speech floor (`--strict-margin-db 12.0` default).
+- **100%-Safety Auto-Profiler & Vintage Reverb Overlap**:
+  - **Low-SNR Safety Gate (`SNR < 12.0 dB`)**: Automatically pauses silence removal when background noise is too high relative to the reciter (`snr_db < 12.0`), returning the full audio untouched (`low_snr_guarded: true`) with a clear bilingual notice to protect Quranic letters.
+  - **Studio** recordings reject close-mic inhalation breaths via high-frequency spectral balance and relax sustain down to `p90 - 26 dB` so soft 1960s studio passages stay intact (`700ms` min silence / `450ms` digital silence gap / `20ms` crossfade).
+  - On **all `vintage/live`** recordings, uses a calm Mujawwad breathing cadence (`650ms` before speech, `1100ms` after speech or `1300ms` when ending `core_db >= reciter_p75`) to capture real decaying mosque reverb and pre-breath hall ambience, enforces a **`>= 1.2s` minimum post-padding effective cut guard** (merging shorter gaps instead of splicing for `0.3s–1.1s`), and overlaps retained segments with a `400ms` equal-power (sin/cos) crossfade (`gap = 0`, yielding `~1.35s`–`1.55s` natural pause) plus a gentle `150ms` start fade-in and `500ms` end fade-out.
+  - **Ultra-Safe Crowd Murmur Filter (`vintage/live`)**: Requires `margin_db = max(10.0, min(14.0, snr_db * 0.40))` (`>= 10 dB` below reciter median) and `max_cluster_span <= 3.5s` inside long pauses (`gap_before >= 1.5s` and `gap_after >= 1.8s`), so soft/quiet verses are never dropped.
+- **Single Ultra-Safe Mode, Multi-Range Clipping & Quality Selection**:
+  - **Single Ultra-Safe Automatic Mode**: Auto-profiled hybrid Silero VAD (`--threshold 0.20`) + energy gate — no aggressive cutting modes exposed.
   - **Multi-Range Clipping & External URLs**: Clean and seamlessly stitch one or more `Start` / `End` (`MM:SS`) time ranges from long recordings or prayers (via uploaded files or external `http://` / `https://` links such as YouTube, SoundCloud, Archive.org, or direct audio URLs via `yt-dlp`), exporting at `128 kbps`, `192 kbps` *(default)*, `256 kbps`, or `Lossless WAV` *(when uploading `.wav` or `.flac`)*.
 
 ## Setup
@@ -46,17 +46,14 @@ In **أنصتوا — Ansitu** you can:
 ## CLI Usage
 
 ```powershell
-# Default natural mode (auto-profiled)
+# Default ultra-safe automatic mode (auto-profiled)
 .\.venv\Scripts\python quran_trim.py recitation.wav
 
 # Extract and clean a specific range (e.g., first 5 minutes)
 .\.venv\Scripts\python quran_trim.py tv_program.mp4 --start 00:00 --end 05:00
 
-# Advanced strict mode for vintage live recordings with distant crowd shouts
-.\.venv\Scripts\python quran_trim.py live_tape.mp3 --mode strict
-
 # Download best audio from any supported URL (YouTube, SoundCloud, Archive.org, direct MP3/M4A)
-.\.venv\Scripts\python quran_trim.py "https://archive.org/details/example_recitation" --mode natural
+.\.venv\Scripts\python quran_trim.py "https://archive.org/details/example_recitation"
 ```
 
 Outputs are saved next to the input as `<filename>_clean.<ext>` and `timestamps.json` (configurable via `-o` and `--timestamps`).

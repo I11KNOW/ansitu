@@ -179,7 +179,6 @@ class EndToEndPipelineTests(unittest.TestCase):
         res_help = self._run_cli("--help")
         self.assertEqual(res_help.returncode, 0, res_help.stderr)
         for flag in (
-            "--mode",
             "--threshold",
             "--pad-start",
             "--pad-end",
@@ -189,7 +188,15 @@ class EndToEndPipelineTests(unittest.TestCase):
             "--end",
         ):
             self.assertIn(flag, res_help.stdout)
+        self.assertNotIn("--mode", res_help.stdout.lower())
+        self.assertNotIn("--strict-margin", res_help.stdout.lower())
+        self.assertNotIn("strict", res_help.stdout.lower())
         self.assertNotIn("prayer", res_help.stdout.lower())
+
+        res_strict = self._run_cli(str(self.fixture_wav), "--mode", "strict")
+        self.assertNotEqual(res_strict.returncode, 0)
+        res_margin = self._run_cli(str(self.fixture_wav), "--strict-margin-db", "10")
+        self.assertNotEqual(res_margin.returncode, 0)
 
         self.assertEqual(parse_timestamp("05:00"), 300.0)
         self.assertEqual(parse_timestamp("01:02:03"), 3723.0)
@@ -246,7 +253,10 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertEqual(info.subtype, "PCM_24")
 
         data = json.loads(ts_json.read_text(encoding="utf-8"))
-        self.assertEqual(data["mode"], "natural")
+        self.assertEqual(data["mode"], "auto")
+        self.assertNotIn("calibration", data)
+        self.assertNotIn("strict_margin_db", data["settings"])
+        self.assertFalse(data["summary"]["low_snr_guarded"])
         self.assertEqual(data["settings"]["pad_start_ms"], 650)
         self.assertEqual(data["settings"]["pad_end_ms"], 1100)
         self.assertEqual(data["settings"]["min_silence_ms"], 900)
@@ -290,32 +300,121 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertLess(start_edge_peak, 5e-3)
         self.assertLess(end_edge_peak, 5e-3)
 
-    def test_wav_strict_mode_filters_crowd(self) -> None:
-        out_dir = self.work_dir / "wav_strict"
-        out_dir.mkdir(exist_ok=True)
-        src = out_dir / "live.wav"
-        src.write_bytes(self.fixture_wav.read_bytes())
+    def test_low_snr_safety_gate_and_hardening_guards(self) -> None:
+        """Verify SNR < 12 dB safety gate, < 1.2s post-padding cut guard, and ultra-safe murmur bounds."""
+        import app as web_app
 
-        res = self._run_cli(str(src), "--mode", "strict")
-        self.assertEqual(res.returncode, 0, res.stderr + "\n" + res.stdout)
+        sr = 16000
+        rng = np.random.default_rng(2026)
 
-        clean_wav = out_dir / "live_clean.wav"
-        ts_json = out_dir / "timestamps.json"
-        self.assertTrue(clean_wav.is_file())
-        self.assertTrue(ts_json.is_file())
+        def _harm_rms(dur_s: float, target_db: float, f0: float = 170.0) -> np.ndarray:
+            n = int(round(dur_s * sr))
+            t = np.arange(n, dtype=np.float64) / float(sr)
+            mod = 0.70 + 0.30 * np.sin(2.0 * np.pi * 3.0 * t)
+            sig = (
+                0.55 * np.sin(2.0 * np.pi * f0 * t)
+                + 0.30 * np.sin(2.0 * np.pi * (2.0 * f0) * t)
+                + 0.15 * np.sin(2.0 * np.pi * (3.0 * f0) * t)
+            ) * mod
+            return _normalize_rms(sig, target_db)
 
-        data = json.loads(ts_json.read_text(encoding="utf-8"))
-        self.assertEqual(data["mode"], "strict")
-        self.assertIn("calibration", data)
-        # Crowd shout (~-31 dBFS) filtered out; only close-mic verse1 & verse2 kept
-        self.assertEqual(data["summary"]["segments_kept"], 2)
+        # 1. Low-SNR Safety Gate (SNR < 12.0 dB): pause silence removal & return [0, duration] untouched
+        noisy = rng.normal(0.0, 10.0 ** (-20.0 / 20.0), int(12.0 * sr))
+        noisy[int(1.0 * sr) : int(3.5 * sr)] += _harm_rms(2.5, -10.5)
+        noisy[int(8.0 * sr) : int(10.5 * sr)] += _harm_rms(2.5, -10.5)
+        vad_guarded = detect_speech_segments(noisy.astype(np.float32), VADConfig(), exact_duration=12.0)
+        self.assertLess(vad_guarded.profile.snr_db, 12.0)
+        self.assertTrue(vad_guarded.low_snr_guarded)
+        self.assertEqual(len(vad_guarded.segments), 1)
+        self.assertEqual(vad_guarded.segments[0].start, 0.0)
+        self.assertEqual(vad_guarded.segments[0].end, 12.0)
 
-        crowd_start_s = self.spans["crowd"][0] / 48000.0
-        crowd_end_s = self.spans["crowd"][1] / 48000.0
-        for seg in data["segments"]:
-            # Ensure crowd center isn't inside any kept segment
-            crowd_mid = 0.5 * (crowd_start_s + crowd_end_s)
-            self.assertFalse(seg["start_s"] <= crowd_mid <= seg["end_s"])
+        low_dir = self.work_dir / "low_snr_gate"
+        low_dir.mkdir(exist_ok=True)
+        low_wav = low_dir / "noisy_recitation.wav"
+        sf.write(str(low_wav), np.column_stack([noisy, noisy]), sr, subtype="PCM_16")
+        res_cli = self._run_cli(str(low_wav))
+        self.assertEqual(res_cli.returncode, 0, res_cli.stderr + "\n" + res_cli.stdout)
+        self.assertIn("low-snr safety gate", res_cli.stdout.lower())
+        self.assertIn("حماية الحروف", res_cli.stdout)
+
+        low_ts = json.loads((low_dir / "timestamps.json").read_text(encoding="utf-8"))
+        self.assertTrue(low_ts["summary"]["low_snr_guarded"])
+        self.assertEqual(low_ts["summary"]["segments_kept"], 1)
+        self.assertEqual(low_ts["summary"]["time_saved_pct"], 0.0)
+        orig_raw, _ = sf.read(str(low_wav), dtype="int16")
+        clean_raw, _ = sf.read(str(low_dir / "noisy_recitation_clean.wav"), dtype="int16")
+        self.assertTrue(np.array_equal(orig_raw, clean_raw))
+
+        res_web_low = web_app.run_cleaning_job(
+            out_format="m4a",
+            quality="192",
+            uploaded_name="noisy.wav",
+            uploaded_bytes=low_wav.read_bytes(),
+        )
+        self.assertTrue(res_web_low["low_snr_guarded"])
+        self.assertEqual(res_web_low["segments_kept"], 1)
+
+        # 2. Minimum effective cut guard (< 1.2s post-padding merges vintage/live; studio unchanged)
+        # 2.6s raw gap - (1.1s pad_end + 0.65s pad_start) = 0.85s < 1.20s -> merged to 1 segment
+        short_cut = rng.normal(0.0, 10.0 ** (-50.0 / 20.0), int(14.0 * sr))
+        short_cut[int(1.0 * sr) : int(5.0 * sr)] += _harm_rms(4.0, -10.0)
+        short_cut[int(7.6 * sr) : int(12.6 * sr)] += _harm_rms(5.0, -10.0)
+        res_merged = detect_speech_segments(short_cut.astype(np.float32), VADConfig(), exact_duration=14.0)
+        self.assertEqual(res_merged.profile.kind, "vintage/live")
+        self.assertEqual(len(res_merged.segments), 1)
+
+        # 3.4s raw gap - 1.75s = 1.65s >= 1.20s -> split into 2 segments
+        long_cut = rng.normal(0.0, 10.0 ** (-50.0 / 20.0), int(15.0 * sr))
+        long_cut[int(1.0 * sr) : int(5.0 * sr)] += _harm_rms(4.0, -10.0)
+        long_cut[int(8.4 * sr) : int(13.4 * sr)] += _harm_rms(5.0, -10.0)
+        res_split = detect_speech_segments(long_cut.astype(np.float32), VADConfig(), exact_duration=15.0)
+        self.assertEqual(len(res_split.segments), 2)
+
+        # Studio keeps cutting even when post-padding gap is < 1.2s (1.4s - 0.5s = 0.9s)
+        studio_cut = rng.normal(0.0, 10.0 ** (-70.0 / 20.0), int(12.0 * sr))
+        studio_cut[int(1.0 * sr) : int(4.5 * sr)] += _harm_rms(3.5, -10.0)
+        studio_cut[int(5.9 * sr) : int(10.0 * sr)] += _harm_rms(4.1, -10.0)
+        res_studio = detect_speech_segments(studio_cut.astype(np.float32), VADConfig(), exact_duration=12.0)
+        self.assertEqual(res_studio.profile.kind, "studio")
+        self.assertEqual(len(res_studio.segments), 2)
+
+        # 3. Ultra-safe murmur bounds: margin = max(10, min(14, snr * 0.40)) & cluster_span <= 3.5s
+        from quran_cleaner.vad import _filter_crowd_murmur_clusters
+
+        murmur_test = rng.normal(0.0, 10.0 ** (-52.0 / 20.0), int(43.0 * sr))
+        murmur_test[int(1.0 * sr) : int(7.0 * sr)] += _harm_rms(6.0, -8.0)     # reciter median ~ -8 dBFS
+        murmur_test[int(10.5 * sr) : int(12.8 * sr)] += _harm_rms(2.3, -17.0)  # 9 dB below (< 10..14 dB margin) -> KEPT
+        murmur_test[int(16.2 * sr) : int(22.2 * sr)] += _harm_rms(6.0, -8.0)
+        # 5.2s cluster (> 3.5s limit: two 2.0s bursts 1.2s apart) at -25 dBFS -> KEPT
+        murmur_test[int(25.6 * sr) : int(27.6 * sr)] += _harm_rms(2.0, -25.0)
+        murmur_test[int(28.8 * sr) : int(30.8 * sr)] += _harm_rms(2.0, -25.0)
+        # Isolated 2.2s burst (<= 3.5s) at -26 dBFS (18 dB below reciter) -> STRIPPED
+        murmur_test[int(34.2 * sr) : int(36.4 * sr)] += _harm_rms(2.2, -26.0)
+        murmur_test[int(39.4 * sr) : int(42.0 * sr)] += _harm_rms(2.6, -8.0)
+
+        res_murmur = detect_speech_segments(murmur_test.astype(np.float32), VADConfig(), exact_duration=43.0)
+        self.assertEqual(res_murmur.stray_shouts_stripped, 1)
+        self.assertTrue(any(s.start <= 11.5 <= s.end for s in res_murmur.segments))
+        self.assertTrue(any(s.start <= 27.0 <= s.end for s in res_murmur.segments))
+        self.assertFalse(any(s.start <= 35.3 <= s.end for s in res_murmur.segments))
+
+        # Verify floor of 10.0 dB margin even at moderate SNR (15 dB -> 15*0.40=6 -> clamped to 10.0 dB)
+        # and verify multi-burst cluster <= 3.5s is stripped while 3.8s > 3.5s is preserved
+        segs_mod = [
+            (0.0, 8.0, -10.0, np.full(10, -10.0)),
+            (11.0, 12.2, -19.0, np.full(10, -19.0)),   # 9 dB below (< 10 dB floor) -> KEPT
+            (15.5, 23.5, -10.0, np.full(10, -10.0)),
+            (26.5, 27.5, -22.0, np.full(10, -22.0)),   # 2 bursts, 1.1s gap, 3.1s span <= 3.5s -> STRIPPED (2)
+            (28.6, 29.6, -22.0, np.full(10, -22.0)),
+            (33.0, 41.0, -10.0, np.full(10, -10.0)),
+            (44.0, 45.4, -22.0, np.full(10, -22.0)),   # 2 bursts, 1.0s gap, 3.8s span > 3.5s -> KEPT
+            (46.4, 47.8, -22.0, np.full(10, -22.0)),
+            (51.0, 59.0, -10.0, np.full(10, -10.0)),
+        ]
+        kept_mod, stripped_cnt = _filter_crowd_murmur_clusters(segs_mod, snr_db=15.0, clip_start_s=0.0, clip_end_s=60.0)
+        self.assertEqual(stripped_cnt, 2)
+        self.assertEqual(len(kept_mod), 7)
 
     def test_mp3_and_m4a_preserve_rate_and_metadata(self) -> None:
         mp3_dir = self.work_dir / "mp3_test"
@@ -367,7 +466,7 @@ class EndToEndPipelineTests(unittest.TestCase):
             check=True,
         )
 
-        res_mp3 = self._run_cli(str(src_mp3), "--mode", "strict")
+        res_mp3 = self._run_cli(str(src_mp3))
         self.assertEqual(res_mp3.returncode, 0, res_mp3.stderr + "\n" + res_mp3.stdout)
         clean_mp3 = mp3_dir / "vintage_clean.mp3"
         self.assertTrue(clean_mp3.is_file())
@@ -454,7 +553,7 @@ class EndToEndPipelineTests(unittest.TestCase):
                 check=True,
             )
 
-            res = self._run_cli(str(src_vid), "--mode", "strict")
+            res = self._run_cli(str(src_vid))
             self.assertEqual(res.returncode, 0, res.stderr + "\n" + res.stdout)
 
             clean_vid = vdir / f"recitation_clean{ext}"
@@ -523,8 +622,6 @@ class EndToEndPipelineTests(unittest.TestCase):
             rc = cli.main(
                 [
                     "https://archive.org/download/quran/test123.m4a",
-                    "--mode",
-                    "natural",
                     "--output-dir",
                     str(yt_dir),
                 ]
@@ -559,7 +656,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         sf.write(str(studio_wav), studio_arr, sr, subtype="PCM_16")
 
         vad_audio = extract_vad_audio(studio_wav)
-        res = detect_speech_segments(vad_audio, VADConfig(mode="natural"), exact_duration=studio_arr.size / sr)
+        res = detect_speech_segments(vad_audio, VADConfig(), exact_duration=studio_arr.size / sr)
         self.assertEqual(res.profile.kind, "studio")
         self.assertLess(res.profile.noise_floor_p5_db, -55.0)
         # Only the 2 speech blocks kept; the 300ms high-frequency breath in the middle is rejected
@@ -600,7 +697,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         arr = np.concatenate([gap, speech, gap, cough_like, gap, speech, gap])
         arr += _normalize_rms(rng.standard_normal(arr.size), -49.0)
 
-        res = detect_speech_segments(arr.astype(np.float32), VADConfig(mode="natural"))
+        res = detect_speech_segments(arr.astype(np.float32), VADConfig())
         self.assertEqual(res.profile.kind, "vintage/live")
         # Both speech blocks are kept while the short low-energy cough/noise blip is dropped
         self.assertEqual(len(res.segments), 2)
@@ -611,7 +708,6 @@ class EndToEndPipelineTests(unittest.TestCase):
         # 1. Uploaded WAV exported directly as playable M4A + live progress checks
         progress_events: list[tuple[int, str]] = []
         res_m4a = web_app.run_cleaning_job(
-            mode="natural",
             start_text="",
             end_text="",
             out_format="m4a",
@@ -620,6 +716,8 @@ class EndToEndPipelineTests(unittest.TestCase):
             progress_cb=lambda pct, msg: progress_events.append((pct, msg)),
         )
         self.assertEqual(res_m4a["output_filename"], "vintage [أنصتوا].m4a")
+        self.assertEqual(res_m4a["mode"], "auto")
+        self.assertFalse(res_m4a["low_snr_guarded"])
         self.assertGreater(len(res_m4a["audio_bytes"]), 1000)
         self.assertGreaterEqual(len(progress_events), 4)
         self.assertEqual(progress_events[-1][0], 100)
@@ -661,7 +759,6 @@ class EndToEndPipelineTests(unittest.TestCase):
             check=True,
         )
         res_mp3 = web_app.run_cleaning_job(
-            mode="natural",
             start_text="00:00",
             end_text="00:13",
             out_format="mp3",
@@ -682,7 +779,6 @@ class EndToEndPipelineTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError) as ctx:
                 web_app.run_cleaning_job(
-                    mode="natural",
                     start_text="",
                     end_text="",
                     out_format="m4a",
@@ -693,7 +789,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertIn("Upload Audio/Video File", msg)
 
     def test_adaptive_room_tone_and_high_ambient_stray_shouts(self) -> None:
-        """Verify high-ambient direct overlap (1250/0/300), stray shout removal, and studio digital silence."""
+        """Verify high-ambient direct overlap (1250/0/400), stray shout removal, and studio digital silence."""
         sr = 48000
         rng = np.random.default_rng(123)
 
@@ -707,12 +803,13 @@ class EndToEndPipelineTests(unittest.TestCase):
                 + 0.30 * np.sin(2.0 * np.pi * 330.0 * t)
                 + 0.15 * np.sin(2.0 * np.pi * 495.0 * t)
             ) * mod
+            wave /= float(np.sqrt(np.mean(wave * wave) + 1e-12))
             fade = min(int(0.03 * sr), n // 4)
             wave[:fade] *= np.linspace(0.0, 1.0, fade)
             wave[-fade:] *= np.linspace(1.0, 0.0, fade)
             buf[s_i : s_i + n] += wave * amp
 
-        # 1. High-ambient vintage live WAV (-26 dBFS floor):
+        # 1. High-ambient vintage live WAV (-26 dBFS floor, ~16 dB SNR >= 12 dB gate & < 18 dB):
         #    Verse 1 (0.5..4.5) + isolated stray shout (7.5..8.7 inside >=3s gaps)
         #    + Verse 2 (11.7..15.7) + immediate crowd reaction (16.5..17.6, gap_before=0.8s < 1.5s)
         total_live_s = 19.5
@@ -721,8 +818,8 @@ class EndToEndPipelineTests(unittest.TestCase):
         live = 0.25 * raw_noise[:-4] + 0.50 * raw_noise[1:-3] + 0.25 * raw_noise[2:-2]
         live *= live_floor_amp / float(np.sqrt(np.mean(live * live) + 1e-12))
 
-        rec_amp = 10.0 ** (-10.0 / 20.0)
-        shout_amp = 10.0 ** (-21.0 / 20.0)
+        rec_amp = 10.0 ** (-9.0 / 20.0)
+        shout_amp = 10.0 ** (-23.0 / 20.0)
         _add_vocal(live, 0.5, 4.0, rec_amp)
         _add_vocal(live, 7.5, 1.2, shout_amp)
         _add_vocal(live, 11.7, 4.0, rec_amp)
@@ -808,7 +905,6 @@ class EndToEndPipelineTests(unittest.TestCase):
 
         # Multi-range Lossless WAV output from FLAC source (spans two verses across 2.6s gaps)
         res_wav = web_app.run_cleaning_job(
-            mode="natural",
             ranges=[("00:00", "00:05"), ("00:10", "00:16")],
             out_format="m4a",
             quality="lossless_wav",
@@ -829,7 +925,6 @@ class EndToEndPipelineTests(unittest.TestCase):
 
         # Multi-range 128 kbps M4A vs 256 kbps MP3
         res_128 = web_app.run_cleaning_job(
-            mode="natural",
             ranges=[("00:00", "00:05"), ("00:10", "00:16")],
             out_format="m4a",
             quality="128",
@@ -844,7 +939,6 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertLess(m4a_info.audio_bit_rate, 180_000)
 
         res_256 = web_app.run_cleaning_job(
-            mode="natural",
             ranges=[("00:00", "00:05"), ("00:10", "00:16")],
             out_format="mp3",
             quality="256",
@@ -859,7 +953,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(mp3_info.audio_bit_rate, 240_000)
 
     def test_surgical_acoustic_fixes_and_external_url_quality_guards(self) -> None:
-        """Verify low-SNR 2.5dB sustain, studio p90-26dB quiet passage, URL/WAV guards, and removed prayer mode."""
+        """Verify 12..22 dB vintage 2.5dB sustain, studio p90-26dB quiet passage, URL/WAV guards, and removed mode args."""
         import app as web_app
 
         sr = 16000
@@ -875,15 +969,18 @@ class EndToEndPipelineTests(unittest.TestCase):
             )
             return sig * (amp / float(np.sqrt(np.mean(sig * sig) + 1e-12)))
 
-        # 1. Low-SNR vintage sustain (spread ~11 dB): steady -10 dBFS head + 2.0s soft tail (~-15.6 dBFS)
-        low_snr = rng.normal(0.0, 10.0 ** (-21.0 / 20.0), int(11.0 * sr))
+        # 1. Moderate-low SNR vintage sustain (spread ~15 dB, >= 12 dB gate & < 22 dB):
+        #    steady -10 dBFS head + 2.0s soft tail (~-16.0 dBFS)
+        low_snr = rng.normal(0.0, 10.0 ** (-25.0 / 20.0), int(11.0 * sr))
         low_snr[int(1.0 * sr) : int(5.0 * sr)] += _harm(4.0, 10.0 ** (-10.0 / 20.0))
-        low_snr[int(5.0 * sr) : int(7.0 * sr)] += _harm(2.0, 10.0 ** (-15.6 / 20.0))
+        low_snr[int(5.0 * sr) : int(7.0 * sr)] += _harm(2.0, 10.0 ** (-16.0 / 20.0))
         low_snr[int(7.5 * sr) : int(10.0 * sr)] += _harm(2.5, 10.0 ** (-10.0 / 20.0))
-        low_res = detect_speech_segments(low_snr.astype(np.float32), VADConfig(mode="natural"), exact_duration=11.0)
+        low_res = detect_speech_segments(low_snr.astype(np.float32), VADConfig(), exact_duration=11.0)
         self.assertEqual(low_res.profile.kind, "vintage/live")
+        self.assertFalse(low_res.low_snr_guarded)
+        self.assertGreaterEqual(low_res.profile.snr_db, 12.0)
         self.assertLess(low_res.profile.snr_db, 22.0)
-        # Soft -15.6 dBFS tail [5.0..7.0s] must remain preserved inside first segment
+        # Soft -16.0 dBFS tail [5.0..7.0s] must remain preserved inside first segment
         self.assertTrue(any(s.start <= 1.2 and s.end >= 6.8 for s in low_res.segments))
 
         # 2. Studio soft passage (-33 dBFS vs -10 dBFS p90 -> p90-23, safely above p90-26)
@@ -891,16 +988,16 @@ class EndToEndPipelineTests(unittest.TestCase):
         studio[int(1.0 * sr) : int(4.5 * sr)] += _harm(3.5, 10.0 ** (-10.0 / 20.0))
         studio[int(6.2 * sr) : int(8.0 * sr)] += _harm(1.8, 10.0 ** (-33.0 / 20.0))
         studio[int(9.0 * sr) : int(11.0 * sr)] += _harm(2.0, 10.0 ** (-10.0 / 20.0))
-        studio_res = detect_speech_segments(studio.astype(np.float32), VADConfig(mode="natural"), exact_duration=12.0)
+        studio_res = detect_speech_segments(studio.astype(np.float32), VADConfig(), exact_duration=12.0)
         self.assertEqual(studio_res.profile.kind, "studio")
         self.assertTrue(any(s.start <= 6.5 and s.end >= 7.7 for s in studio_res.segments))
 
-        # 3. Removed prayer mode is rejected cleanly in CLI & web runner
+        # 3. Removed mode flags/args (prayer/strict) are rejected cleanly in CLI & web runner
         res_bad_mode = self._run_cli(str(self.fixture_wav), "--mode", "prayer")
         self.assertNotEqual(res_bad_mode.returncode, 0)
-        with self.assertRaises(ValueError):
-            web_app.run_cleaning_job(
-                mode="prayer",
+        with self.assertRaises(TypeError):
+            web_app.run_cleaning_job(  # type: ignore[call-arg]
+                mode="strict",
                 out_format="m4a",
                 quality="192",
                 uploaded_name="sample.wav",
@@ -910,7 +1007,6 @@ class EndToEndPipelineTests(unittest.TestCase):
         # 4. Web app Lossless WAV blocked for compressed uploads and external URLs, plus SoundCloud mock
         with self.assertRaises(ValueError):
             web_app.run_cleaning_job(
-                mode="natural",
                 out_format="m4a",
                 quality="lossless_wav",
                 uploaded_name="track.mp3",
@@ -918,7 +1014,6 @@ class EndToEndPipelineTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             web_app.run_cleaning_job(
-                mode="natural",
                 out_format="m4a",
                 quality="lossless_wav",
                 external_url="https://soundcloud.com/qari/recitation",
@@ -931,7 +1026,6 @@ class EndToEndPipelineTests(unittest.TestCase):
         )
         with patch("app.download_youtube_audio", return_value=m4a_dl) as mock_dl:
             res_sc = web_app.run_cleaning_job(
-                mode="natural",
                 out_format="m4a",
                 quality="192",
                 external_url="https://soundcloud.com/qari/surah-qaf",
@@ -941,7 +1035,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertEqual(res_sc["quality"], "192")
 
     def test_universal_vintage_overlap_cluster_murmur_and_dynamic_pad_end(self) -> None:
-        """Verify <=-50dBFS vintage/live gets 400ms overlap, 650/1100/1300ms dynamic pad_end, and cluster murmur rules."""
+        """Verify <=-50dBFS vintage/live gets 400ms overlap, 650/1100/1300ms dynamic pad_end, and <=3.5s cluster murmur rules."""
         sr = 16000
         rng = np.random.default_rng(99)
 
@@ -957,25 +1051,25 @@ class EndToEndPipelineTests(unittest.TestCase):
             ) * mod
             buf[s0 : s0 + n] += sig * (amp / float(np.sqrt(np.mean(sig * sig) + 1e-12)))
 
-        # Timeline (~58.5s total) with -52 dBFS vintage floor (<= -50 dBFS like Hud/Yunus/An'am):
+        # Timeline (~60.0s total) with -52 dBFS vintage floor (<= -50 dBFS like Hud/Yunus/An'am):
         #  1.0..9.0s: Loud Verse 1 ending (-6 dBFS finale >= reciter_p75 -> gets 1300ms pad_end!)
-        # 12.0..14.0s + 15.1..17.2s: 2-burst crowd murmur cluster (each >= 2.0s, 1.1s < 1.8s link, span 5.2s <= 12s,
-        #                          gaps >= 3.0s before and >= 3.0s after -> STRIPPED as 2 bursts)
+        # 12.0..13.2s + 13.9..15.1s: 2-burst crowd murmur cluster (span 3.1s <= 3.5s, 0.7s < 1.8s link,
+        #                          gaps >= 3.0s before and >= 5.0s after, 16 dB below reciter -> STRIPPED as 2 bursts)
         # 20.2..28.2s: Moderate Verse 2 ending (-11 dBFS < reciter_p75 -> gets 1100ms pad_end!)
-        # 31.2..46.0s: Sustained soft recitation (> 12s: three 4.2s phrases with 1.1s gaps = 14.8s at -24.5 dBFS -> KEPT!)
-        # 49.0..57.0s: Loud Verse 3 (-8 dBFS)
-        arr = rng.normal(0.0, 10.0 ** (-52.0 / 20.0), int(59.0 * sr))
+        # 31.6..46.4s: Sustained soft recitation (> 3.5s: three 4.2s phrases with 1.1s gaps = 14.8s at -24.5 dBFS -> KEPT!)
+        # 49.8..57.8s: Loud Verse 3 (-8 dBFS)
+        arr = rng.normal(0.0, 10.0 ** (-52.0 / 20.0), int(60.0 * sr))
         _add_harm(arr, 1.0, 7.0, 10.0 ** (-8.5 / 20.0))
         _add_harm(arr, 8.0, 1.0, 10.0 ** (-6.0 / 20.0))
-        _add_harm(arr, 12.0, 2.0, 10.0 ** (-24.5 / 20.0))
-        _add_harm(arr, 15.1, 2.1, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 12.0, 1.2, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 13.9, 1.2, 10.0 ** (-24.5 / 20.0))
         _add_harm(arr, 20.2, 8.0, 10.0 ** (-11.0 / 20.0))
-        _add_harm(arr, 31.2, 4.2, 10.0 ** (-24.5 / 20.0))
-        _add_harm(arr, 36.5, 4.2, 10.0 ** (-24.5 / 20.0))
-        _add_harm(arr, 41.8, 4.2, 10.0 ** (-24.5 / 20.0))
-        _add_harm(arr, 49.0, 8.0, 10.0 ** (-8.0 / 20.0))
+        _add_harm(arr, 31.6, 4.2, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 36.9, 4.2, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 42.2, 4.2, 10.0 ** (-24.5 / 20.0))
+        _add_harm(arr, 49.8, 8.0, 10.0 ** (-8.0 / 20.0))
 
-        res = detect_speech_segments(arr.astype(np.float32), VADConfig(mode="natural"), exact_duration=59.0)
+        res = detect_speech_segments(arr.astype(np.float32), VADConfig(), exact_duration=60.0)
         self.assertEqual(res.profile.kind, "vintage/live")
         self.assertLessEqual(res.profile.noise_floor_p5_db, -50.0)
         self.assertEqual(res.resolved_pad_start_ms, 650)
@@ -984,10 +1078,10 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertEqual(res.resolved_crossfade_ms, 400)
         self.assertEqual(res.resolved_gap_ms, 0)
         self.assertTrue(res.direct_overlap)
-        self.assertEqual(res.stray_shouts_stripped, 2)
+        self.assertEqual(res.stray_shouts_stripped, 1)
 
-        # Murmur cluster [12.0..17.2] stripped; soft >12s recitation [31.2..46.0] preserved!
-        self.assertFalse(any(s.start <= 14.5 <= s.end for s in res.segments))
+        # Murmur cluster [12.0..15.1] stripped; soft >3.5s recitation [31.6..46.4] preserved!
+        self.assertFalse(any(s.start <= 13.5 <= s.end for s in res.segments))
         self.assertTrue(any(s.start <= 38.0 <= s.end for s in res.segments))
 
         # Loud ending (Verse 1 ending at ~9.0s) gets ~1300ms pad_end (~10.30s), moderate Verse 2 (~28.2s) gets ~1100ms (~29.30s)
