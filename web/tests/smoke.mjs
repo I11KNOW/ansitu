@@ -176,10 +176,10 @@ function checkI18nAndHtmlRules() {
   assert.ok(en.resultSilenceSkippedNotice.length > 20);
   assert.ok(ar.resultSilencePartialNotice.length > 20);
   assert.ok(en.resultSilencePartialNotice.length > 20);
-  assert.ok(ar.trimHintRemove.includes("ثانية"), "AR remove hint must include ~1s margin tip");
-  assert.ok(ar.trimHintKeep.includes("ثانية"), "AR keep hint must include ~1s margin tip");
-  assert.ok(en.trimHintRemove.includes("1 second"), "EN remove hint must include ~1s margin tip");
-  assert.ok(en.trimHintKeep.includes("1 second"), "EN keep hint must include ~1s margin tip");
+  assert.ok(!ar.trimHintRemove.includes("ثانية"), "AR remove hint must not include ~1s margin tip");
+  assert.ok(!ar.trimHintKeep.includes("ثانية"), "AR keep hint must not include ~1s margin tip");
+  assert.ok(!en.trimHintRemove.includes("1 second"), "EN remove hint must not include ~1s margin tip");
+  assert.ok(!en.trimHintKeep.includes("1 second"), "EN keep hint must not include ~1s margin tip");
   assert.ok(ar.errors.allAudioRemoved.length > 10);
   assert.ok(en.errors.allAudioRemoved.length > 10);
   assert.ok(html.includes("تنقية التلاوة"));

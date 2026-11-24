@@ -1,20 +1,54 @@
-# أنصتوا — Ansitu (`quran-trim`)
+# أَنصِتُوا — ansitu
 
-A fast, modular Python CLI and bilingual (Arabic-first RTL / English) Streamlit web app to automatically remove long silences, breaths, and isolated crowd murmurs from Quran recitation audio and video files — engineered for vintage live recordings to preserve analog tape warmth, room ambience, and full dynamic range without dynamic compression or denoising.
+**Live Web App (PWA):** [https://ansitu.pages.dev](https://ansitu.pages.dev)
 
-## Features & Architecture
+A calm, bilingual (Arabic RTL / English LTR) client-side web app that automatically removes long pauses between Quranic verses while preserving every letter, breath, and natural hall ambience of the recitation.
 
-- **Dual-Rate Zero-Loss Pipeline**: Decodes a temporary 16kHz mono stream (with an 80Hz high-pass filter for VAD analysis only) for hybrid Silero VAD + vocal-band energy detection, then maps exact timestamps back to slice and concatenate the **original high-sample-rate audio/video stream** (`soundfile` for `.wav -> .wav`, streaming FFmpeg for `.mp3`, `.m4a`, `.mp4`, `.mkv`, `.webm`, `.opus`, `.flac`).
-- **100%-Safety Auto-Profiler & Vintage Reverb Overlap**:
-  - **Low-SNR Safety Gate (`SNR < 12.0 dB`)**: Automatically pauses silence removal when background noise is too high relative to the reciter (`snr_db < 12.0`), returning the full audio untouched (`low_snr_guarded: true`) with a clear bilingual notice to protect Quranic letters.
-  - **Studio** recordings reject close-mic inhalation breaths via high-frequency spectral balance and relax sustain down to `p90 - 26 dB` so soft 1960s studio passages stay intact (`700ms` min silence / `450ms` digital silence gap / `20ms` crossfade).
-  - On **all `vintage/live`** recordings, uses a calm Mujawwad breathing cadence (`650ms` before speech, `1100ms` after speech or `1300ms` when ending `core_db >= reciter_p75`) to capture real decaying mosque reverb and pre-breath hall ambience, enforces a **`>= 1.2s` minimum post-padding effective cut guard** (merging shorter gaps instead of splicing for `0.3s–1.1s`), and overlaps retained segments with a `400ms` equal-power (sin/cos) crossfade (`gap = 0`, yielding `~1.35s`–`1.55s` natural pause) plus a gentle `150ms` start fade-in and `500ms` end fade-out.
-  - **Ultra-Safe Crowd Murmur Filter (`vintage/live`)**: Requires `margin_db = max(10.0, min(14.0, snr_db * 0.40))` (`>= 10 dB` below reciter median) and `max_cluster_span <= 3.5s` inside long pauses (`gap_before >= 1.5s` and `gap_after >= 1.8s`), so soft/quiet verses are never dropped.
-- **Single Ultra-Safe Mode, Multi-Range Clipping & Quality Selection**:
-  - **Single Ultra-Safe Automatic Mode**: Auto-profiled hybrid Silero VAD (`--threshold 0.20`) + energy gate — no aggressive cutting modes exposed.
-  - **Multi-Range Clipping & External URLs**: Clean and seamlessly stitch one or more `Start` / `End` (`MM:SS`) time ranges from long recordings or prayers (via uploaded files or external `http://` / `https://` links such as YouTube, SoundCloud, Archive.org, or direct audio URLs via `yt-dlp`), exporting at `128 kbps`, `192 kbps` *(default)*, `256 kbps`, or `Lossless WAV` *(when uploading `.wav` or `.flac`)*.
+---
 
-## Setup
+## Web App (`web/`) — 100% Client-Side PWA
+
+Everything runs locally inside the user's browser — **no server uploads, no backend processing, and full offline support** once installed as a PWA.
+
+### Privacy-First Architecture
+- **Pure JS Energy DSP VAD (`web/engine/vad.js`)**: Zero-dependency ES module port of the acoustic profiler and voice activity engine — engineered for both studio and vintage live mosque recordings without heavy neural/ONNX downloads.
+- **Dedicated Web Worker (`web/worker.js`)**: Keeps the UI responsive during decoding, analysis, splicing, and encoding, with instant cancellation and automatic WASM memory reclamation when each job finishes.
+- **Lazy-Loaded `ffmpeg-core.wasm`**: Not pre-cached or fetched on initial page load; loaded on demand only when the user starts processing (multi-threaded `@ffmpeg/core-mt` when `crossOriginIsolated`, with single-threaded fallback) and runtime-cached by the Service Worker after first use.
+- **Featherweight Initial Load**: **~90 KB uncompressed (~30 KB gzipped)** initial payload with zero external font stylesheets or render-blocking scripts, backed by an offline PWA Service Worker (`web/sw.js`).
+- **Native-Rate `Int16Array` Splicing & Headroom Preservation (`web/engine/splicer.js`)**: Splices at the original sample rate in `Int16Array` (50% less mobile RAM than `Float32Array`), applies `-6 dB` decode headroom for lossy inputs to prevent clipping hot masters, and preserves basic container text metadata (`title`, `artist`, `album`).
+- **Export Quality Presets**: `128 kbps`, `192 kbps` *(default)*, `256 kbps` in `M4A` or `MP3`, plus automatic `Lossless WAV` for `.wav` / `.flac` sources.
+
+### Two Recitation Modes
+1. **Normal Recitation (`تلاوة عادية`)**:
+   - Auto-profiles studio vs. vintage/live recordings, preserves natural Mujawwad breathing cadence and reverb tails, and enforces the **Low-SNR safety gate (`SNR < 12 dB`)** — pausing automatic silence removal when background noise is too high so zero Quranic letters are ever clipped.
+2. **Prayer Mode (`تلاوة صلاة`)**:
+   - Includes a **Remove vs. Keep ranges** toggle (`حذف هذه المقاطع` / `الاحتفاظ بهذه المقاطع فقط`) with mobile-friendly numeric timestamp inputs (`00:45`, `00.45`, `0045`, `130`, `10530`).
+   - Uses a clean **2-step pipeline**:
+     1. **Step 1 — Pure Montage (`buildMontageInt16`)**: Resolves kept ranges and concatenates the decoded PCM slices directly in order with strict mono/stereo frame alignment and a 5 ms de-click micro-fade at raw cut boundaries (zero overlapping crossfade, zero synthetic gap).
+     2. **Step 2 — Single-Stream Silence Removal**: Feeds the concatenated montage into the exact same single-stream Normal Mode VAD + splicer pipeline. If `low_snr_guarded` triggers or no long silences are found, exports the Step 1 pure montage directly with a gentle notice so the user's prayer montage is never discarded.
+
+### Local Development & Verification
+
+Requires Node.js 18+.
+
+```bash
+# Start local dev server with COOP/COEP headers (http://127.0.0.1:4173)
+node web/dev-server.mjs
+
+# Run automated Stage 2 smoke & Prayer Mode unit tests
+node web/tests/smoke.mjs
+
+# Run Python-vs-JS DSP parity verification (requires Python venv below)
+node web/tests/parity.mjs
+```
+
+---
+
+## Legacy Python CLI & Streamlit App
+
+The original Python engine (`quran_cleaner/`), CLI (`quran_trim.py`), and Streamlit interface (`app.py`) remain in this repository for desktop/CLI batch workflows, video inputs, and external URL downloads (`yt-dlp`).
+
+### Setup
 
 Requires `ffmpeg` and `ffprobe` on `PATH` (`packages.txt` installs `ffmpeg` automatically on Debian/Ubuntu/Streamlit Cloud).
 
@@ -25,25 +59,15 @@ python -m venv .venv
 
 `requirements.txt` uses PyTorch's CPU-only wheel index (`--extra-index-url https://download.pytorch.org/whl/cpu`) so cloud deployments stay lightweight.
 
-## Web App Usage (أنصتوا | Ansitu)
-
-Launch the bilingual Streamlit app locally:
+### Streamlit Web App
 
 ```powershell
 .\.venv\Scripts\streamlit run app.py
 ```
 
-In **أنصتوا — Ansitu** you can:
-1. **📁 رفع ملف صوتي أو فيديو | Upload Audio / Video File** (`mp3`, `wav`, `m4a`, `mp4`, `mkv`, `webm`, `opus`, `flac`) or switch to **🔗 رابط خارجي | External Media URL** (`http://` / `https://` links from YouTube, SoundCloud, Archive.org, or direct media URLs).
-2. Select output format (`m4a` / `mp3`), quality (`128 kbps`, `192 kbps`, `256 kbps`, plus `Lossless WAV` for `.wav`/`.flac` uploads), and add one or more optional `Start` / `End` clip ranges (`➕ أضف مقطعاً آخر | + Add Range`) to extract and stitch desired passages cleanly.
-3. Monitor live progress, preview the cleaned recitation inline, inspect metrics, and download the output + `timestamps.json`.
+Supports uploading audio/video files (`mp3`, `wav`, `m4a`, `mp4`, `mkv`, `webm`, `opus`, `flac`) or pasting external media URLs (`http://` / `https://` via `yt-dlp`), selecting `128` / `192` / `256 kbps` or `Lossless WAV`, and clipping optional `Start` / `End` ranges.
 
-### Streamlit Community Cloud Deployment
-
-1. Push this repository to GitHub (`app.py`, `requirements.txt`, `packages.txt`, `.streamlit/config.toml`).
-2. Create an app on [share.streamlit.io](https://share.streamlit.io) pointing to `app.py`.
-
-## CLI Usage
+### Python CLI Usage
 
 ```powershell
 # Default ultra-safe automatic mode (auto-profiled)
@@ -58,7 +82,7 @@ In **أنصتوا — Ansitu** you can:
 
 Outputs are saved next to the input as `<filename>_clean.<ext>` and `timestamps.json` (configurable via `-o` and `--timestamps`).
 
-## Running Tests
+### Python Unit Tests
 
 ```powershell
 .\.venv\Scripts\python -m unittest discover -s tests -v
