@@ -66,7 +66,7 @@ export const TRANSLATIONS = {
     resultSummary: (orig, final, saved) =>
       `قَلّت المدة من ${orig} إلى ${final} (تم توفير ${saved})`,
     resultSilenceSkippedNotice:
-      "تم تجهيز ودمج المقاطع التي حدّدتها بنجاح. ونظراً لارتفاع الضوضاء الخلفية، تم تخطي حذف السكتات التلقائي حفاظاً على كل حرف من التلاوة.",
+      "تم تجهيز ودمج المقاطع التي حدّدتها بنجاح، مع تخطي حذف السكتات التلقائي حفاظاً على كل حرف من التلاوة.",
     resultSilencePartialNotice:
       "تم تجهيز المقاطع التي حدّدتها وحذف السكتات الطويلة من المقاطع الصافية، بينما تم الإبقاء على بعض المقاطع ذات الضوضاء المرتفعة دون قصّ تلقائي حفاظاً على التلاوة.",
     downloadBtn: "تحميل التلاوة",
@@ -163,7 +163,7 @@ export const TRANSLATIONS = {
     resultSummary: (orig, final, saved) =>
       `Duration reduced from ${orig} to ${final} (${saved} saved)`,
     resultSilenceSkippedNotice:
-      "Your requested segments were prepared and joined. Because of high background noise, automatic silence removal was skipped to protect every letter of the recitation.",
+      "Your requested segments were prepared and joined, while automatic silence removal was skipped to protect every letter of the recitation.",
     resultSilencePartialNotice:
       "Your requested segments were prepared: long pauses were trimmed from clean sections, while noisy sections were kept intact without automatic trimming to protect the recitation.",
     downloadBtn: "Download audio",

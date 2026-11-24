@@ -8,8 +8,7 @@
 
 export const EDGE_FADE_IN_MS = 150;
 export const EDGE_FADE_OUT_MS = 500;
-export const INTER_RANGE_MICRO_FADE_MS = 12;
-export const INTER_RANGE_GAP_MS = 400;
+export const MONTAGE_DECLICK_MS = 5;
 export const INT16_MAX = 32767;
 export const INT16_MIN = -32767;
 
@@ -718,12 +717,11 @@ export function spliceAudioInt16({
 }
 
 /**
- * Apply a smooth half-cosine micro fade-in or fade-out in-place on an interleaved `Int16Array`.
- * Used for non-overlapping de-click edges between distinct Prayer Mode ranges.
+ * Apply a tiny half-cosine de-click micro-fade in-place on an interleaved `Int16Array` slice.
+ * Operates strictly in frame units multiplied by `channels` to preserve stereo alignment.
  */
-function applyMicroFadeInt16(buf, channels, fadeSamples, direction) {
-  const totalFrames = Math.floor(buf.length / channels);
-  const n = Math.min(Math.max(0, fadeSamples), totalFrames);
+function applyMicroFadeRangeInt16(buf, channels, startFrame, frameCount, fadeFrames, direction) {
+  const n = Math.min(Math.max(0, fadeFrames), frameCount);
   if (n <= 1) {
     return;
   }
@@ -731,16 +729,16 @@ function applyMicroFadeInt16(buf, channels, fadeSamples, direction) {
   if (direction === "in") {
     for (let f = 0; f < n; f++) {
       const gain = 0.5 * (1.0 - Math.cos((Math.PI * f) / denom));
-      const off = f * channels;
+      const off = (startFrame + f) * channels;
       for (let ch = 0; ch < channels; ch++) {
         buf[off + ch] = clampInt16(buf[off + ch] * gain);
       }
     }
   } else {
-    const startF = totalFrames - n;
+    const fadeStart = startFrame + frameCount - n;
     for (let f = 0; f < n; f++) {
       const gain = 0.5 * (1.0 + Math.cos((Math.PI * f) / denom));
-      const off = (startF + f) * channels;
+      const off = (fadeStart + f) * channels;
       for (let ch = 0; ch < channels; ch++) {
         buf[off + ch] = clampInt16(buf[off + ch] * gain);
       }
@@ -749,15 +747,78 @@ function applyMicroFadeInt16(buf, channels, fadeSamples, direction) {
 }
 
 /**
- * Stitch and splice one or more VADResult range groups seamlessly in `Int16Array`.
+ * Step 1 of Prayer Mode: concatenate kept ranges of decoded PCM directly in order
+ * (pure straight montage — NO overlapping crossfade, NO synthetic gap or room-tone bridge).
  *
- * - Single range (`rangeResults.length === 1`): exact port of `_build_range_stream_items` +
- *   `render_clean_ranges` (100% parity for Normal Mode).
- * - Multiple distinct ranges (`rangeResults.length > 1`, e.g. Prayer Mode): each range's
- *   internal pauses are spliced independently without bleeding past range boundaries, and
- *   distinct user ranges are joined NON-OVERLAPPINGLY with a 12 ms de-click micro-fade
- *   separated by a natural quiet/room-tone pause (~400 ms default) so tight cuts never
- *   swallow an incoming initial consonant.
+ * Preserves exact interleaved mono/stereo frame alignment and applies only a tiny
+ * `declickMs` (default 5 ms) half-cosine micro-fade at raw cut boundaries so there is
+ * zero digital pop and zero letter clipping.
+ */
+export function buildMontageInt16({
+  pcm,
+  sampleRate,
+  channels = 1,
+  keptRanges,
+  declickMs = MONTAGE_DECLICK_MS,
+}) {
+  if (!pcm || pcm.length === 0 || !Array.isArray(keptRanges) || keptRanges.length === 0) {
+    throw new Error("No valid audio ranges provided for montage.");
+  }
+
+  const totalFrames = Math.floor(pcm.length / channels);
+  const slices = [];
+  let outputFrames = 0;
+
+  for (const r of keptRanges) {
+    const sFrame = Math.max(0, Math.min(totalFrames, Math.round(r.startS * sampleRate)));
+    const eFrame = Math.max(sFrame, Math.min(totalFrames, Math.round(r.endS * sampleRate)));
+    const len = eFrame - sFrame;
+    if (len > 0) {
+      slices.push({ sFrame, eFrame, len });
+      outputFrames += len;
+    }
+  }
+
+  if (outputFrames === 0) {
+    throw new Error("ALL_AUDIO_REMOVED");
+  }
+
+  const out = new Int16Array(outputFrames * channels);
+  const declickFrames = Math.max(0, Math.round((declickMs / 1000.0) * sampleRate));
+  let writeFrame = 0;
+
+  for (let i = 0; i < slices.length; i++) {
+    const { sFrame, eFrame, len } = slices[i];
+    out.set(pcm.subarray(sFrame * channels, eFrame * channels), writeFrame * channels);
+
+    const hasCutBefore = i > 0 ? slices[i - 1].eFrame !== sFrame : sFrame > 0;
+    const hasCutAfter =
+      i < slices.length - 1 ? slices[i + 1].sFrame !== eFrame : eFrame < totalFrames;
+
+    if (declickFrames > 1) {
+      if (hasCutBefore) {
+        applyMicroFadeRangeInt16(out, channels, writeFrame, len, declickFrames, "in");
+      }
+      if (hasCutAfter) {
+        applyMicroFadeRangeInt16(out, channels, writeFrame, len, declickFrames, "out");
+      }
+    }
+
+    writeFrame += len;
+  }
+
+  return {
+    pcm: out,
+    frames: outputFrames,
+    duration: outputFrames / sampleRate,
+    sampleRate,
+    channels,
+  };
+}
+
+/**
+ * Stitch and splice one or more VADResult range groups seamlessly in `Int16Array`
+ * (exact port of `_build_range_stream_items` + `render_clean_ranges`).
  */
 export function spliceRangesInt16({
   pcm,
@@ -768,43 +829,44 @@ export function spliceRangesInt16({
   fadeEdges = null,
   edgeFadeInMs = EDGE_FADE_IN_MS,
   edgeFadeOutMs = EDGE_FADE_OUT_MS,
-  interRangeGapMs = INTER_RANGE_GAP_MS,
-  interRangeMicroFadeMs = INTER_RANGE_MICRO_FADE_MS,
 }) {
   if (!rangeResults || rangeResults.length === 0) {
     throw new Error("At least one range result is required.");
   }
 
+  const effCrossfadeMs =
+    crossfadeMs !== null && crossfadeMs !== undefined
+      ? crossfadeMs
+      : Math.max(...rangeResults.map((vr) => vr.resolved_crossfade_ms ?? 0));
   const effFadeEdges =
     fadeEdges !== null && fadeEdges !== undefined
       ? fadeEdges
       : !rangeResults.every((vr) => Boolean(vr.low_snr_guarded));
-  const totalFrames = Math.floor(pcm.length / channels);
 
-  // Fast single-range path (Normal Mode & single Prayer range) — exact parity
-  if (rangeResults.length === 1) {
-    const vr = rangeResults[0];
+  const totalFrames = Math.floor(pcm.length / channels);
+  const fadeSamples = Math.max(0, Math.round((effCrossfadeMs / 1000.0) * sampleRate));
+  const perRange = [];
+  const lastRangeIdx = rangeResults.length - 1;
+
+  for (let rIdx = 0; rIdx < rangeResults.length; rIdx++) {
+    const vr = rangeResults[rIdx];
     if (!vr.segments || vr.segments.length === 0) {
-      throw new Error("Range #1 had no speech segments detected.");
+      throw new Error(`Range #${rIdx + 1} had no speech segments detected.`);
     }
-    const effCrossfadeMs =
-      crossfadeMs !== null && crossfadeMs !== undefined
-        ? crossfadeMs
-        : (vr.resolved_crossfade_ms ?? 0);
-    const fadeSamples = Math.max(0, Math.round((effCrossfadeMs / 1000.0) * sampleRate));
+    const isLastRange = rIdx === lastRangeIdx;
     const gapSamples = Math.max(0, Math.round(((vr.resolved_gap_ms ?? 0) / 1000.0) * sampleRate));
     const sRanges = buildSampleRanges(
       vr.segments,
       sampleRate,
       totalFrames,
       fadeSamples,
-      false,
+      !isLastRange,
       gapSamples > 0
     );
     if (sRanges.length === 0) {
-      throw new Error("No valid audio sample ranges remained after slicing.");
+      continue;
     }
-    const needsGap = gapSamples > 0 && sRanges.length > 1;
+    const needsGap = gapSamples > 0 && (sRanges.length > 1 || !isLastRange);
     const gapBuf = needsGap
       ? buildRoomToneBufferInt16({
           pcm,
@@ -815,16 +877,28 @@ export function spliceRangesInt16({
           fadeSamples,
         })
       : null;
+    perRange.push({ sRanges, gapBuf });
+  }
 
-    const streamItems = [];
+  if (perRange.length === 0) {
+    throw new Error("No valid audio sample ranges remained after slicing.");
+  }
+
+  const streamItems = [];
+  const lastGroupIdx = perRange.length - 1;
+  for (let gIdx = 0; gIdx < perRange.length; gIdx++) {
+    const { sRanges, gapBuf } = perRange[gIdx];
+    const isLastGroup = gIdx === lastGroupIdx;
+    const lastSegIdx = sRanges.length - 1;
     for (let sIdx = 0; sIdx < sRanges.length; sIdx++) {
       const [sFrame, eFrame] = sRanges[sIdx];
+      const isLastOverall = isLastGroup && sIdx === lastSegIdx;
       streamItems.push({
         buffer: pcm,
         startFrame: sFrame,
         length: eFrame - sFrame,
       });
-      if (sIdx < sRanges.length - 1 && gapBuf && gapBuf.length > 0) {
+      if (!isLastOverall && gapBuf && gapBuf.length > 0) {
         streamItems.push({
           buffer: gapBuf,
           startFrame: 0,
@@ -832,189 +906,17 @@ export function spliceRangesInt16({
         });
       }
     }
-
-    return renderStreamItemsInt16({
-      items: streamItems,
-      sampleRate,
-      channels,
-      crossfadeMs: effCrossfadeMs,
-      fadeEdges: effFadeEdges,
-      edgeFadeInMs,
-      edgeFadeOutMs,
-    });
   }
 
-  // Multi-range path: render each range independently (zero cross-boundary tail bleed)
-  // and join non-overlappingly with 12 ms de-click micro-fades + natural pause gap.
-  const microFadeSamples = Math.max(
-    0,
-    Math.round((interRangeMicroFadeMs / 1000.0) * sampleRate)
-  );
-  const renderedGroups = [];
-
-  for (let rIdx = 0; rIdx < rangeResults.length; rIdx++) {
-    const vr = rangeResults[rIdx];
-    if (!vr.segments || vr.segments.length === 0) {
-      throw new Error(`Range #${rIdx + 1} had no speech segments detected.`);
-    }
-    const rangeCrossfadeMs =
-      crossfadeMs !== null && crossfadeMs !== undefined
-        ? crossfadeMs
-        : (vr.resolved_crossfade_ms ?? 0);
-    const fadeSamples = Math.max(0, Math.round((rangeCrossfadeMs / 1000.0) * sampleRate));
-    const gapSamples = Math.max(0, Math.round(((vr.resolved_gap_ms ?? 0) / 1000.0) * sampleRate));
-    const sRanges = buildSampleRanges(
-      vr.segments,
-      sampleRate,
-      totalFrames,
-      fadeSamples,
-      false, // Never extend past a user range's end boundary
-      gapSamples > 0
-    );
-    if (sRanges.length === 0) {
-      continue;
-    }
-
-    const needsInternalGap = gapSamples > 0 && sRanges.length > 1;
-    const internalGapBuf = needsInternalGap
-      ? buildRoomToneBufferInt16({
-          pcm,
-          sampleRate,
-          channels,
-          vadResult: vr,
-          gapSamples,
-          fadeSamples,
-        })
-      : null;
-
-    const items = [];
-    for (let sIdx = 0; sIdx < sRanges.length; sIdx++) {
-      const [sFrame, eFrame] = sRanges[sIdx];
-      items.push({
-        buffer: pcm,
-        startFrame: sFrame,
-        length: eFrame - sFrame,
-      });
-      if (sIdx < sRanges.length - 1 && internalGapBuf && internalGapBuf.length > 0) {
-        items.push({
-          buffer: internalGapBuf,
-          startFrame: 0,
-          length: Math.floor(internalGapBuf.length / channels),
-        });
-      }
-    }
-
-    const rendered = renderStreamItemsInt16({
-      items,
-      sampleRate,
-      channels,
-      crossfadeMs: rangeCrossfadeMs,
-      fadeEdges: false,
-    });
-    if (rendered.frames > 0) {
-      renderedGroups.push({ pcm: rendered.pcm, frames: rendered.frames, vr });
-    }
-  }
-
-  if (renderedGroups.length === 0) {
-    throw new Error("No valid audio sample ranges remained after slicing.");
-  }
-
-  const concatParts = [];
-  let outputFrames = 0;
-  const lastGroupIdx = renderedGroups.length - 1;
-
-  for (let gIdx = 0; gIdx < renderedGroups.length; gIdx++) {
-    const grp = renderedGroups[gIdx];
-    const isFirst = gIdx === 0;
-    const isLast = gIdx === lastGroupIdx;
-
-    if (!isFirst && microFadeSamples > 0) {
-      applyMicroFadeInt16(grp.pcm, channels, microFadeSamples, "in");
-    }
-    if (!isLast && microFadeSamples > 0) {
-      applyMicroFadeInt16(grp.pcm, channels, microFadeSamples, "out");
-    }
-
-    concatParts.push(grp.pcm);
-    outputFrames += grp.frames;
-
-    if (!isLast) {
-      const pauseMs =
-        (grp.vr.resolved_gap_ms ?? 0) > 0 ? grp.vr.resolved_gap_ms : interRangeGapMs;
-      const pauseSamples = Math.max(0, Math.round((pauseMs / 1000.0) * sampleRate));
-      if (pauseSamples > 0) {
-        const useTone =
-          Boolean(grp.vr.use_room_tone) ||
-          (grp.vr.profile?.noise_floor_p5_db ?? -60.0) > -50.0;
-        const pauseBuf = buildRoomToneBufferInt16({
-          pcm,
-          sampleRate,
-          channels,
-          vadResult: {
-            ...grp.vr,
-            use_room_tone: useTone,
-          },
-          gapSamples: pauseSamples,
-          fadeSamples: 0, // Exact non-overlapping pause length
-        });
-        if (pauseBuf && pauseBuf.length > 0) {
-          if (microFadeSamples > 0) {
-            applyMicroFadeInt16(pauseBuf, channels, microFadeSamples, "in");
-            applyMicroFadeInt16(pauseBuf, channels, microFadeSamples, "out");
-          }
-          concatParts.push(pauseBuf);
-          outputFrames += Math.floor(pauseBuf.length / channels);
-        }
-      }
-    }
-  }
-
-  const out = new Int16Array(outputFrames * channels);
-  let offset = 0;
-  for (const part of concatParts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-
-  // Apply outer output edge fades only at the very start & very end of the combined file
-  if (effFadeEdges && outputFrames > 0) {
-    const fadeInSamples = Math.max(0, Math.round((edgeFadeInMs / 1000.0) * sampleRate));
-    if (fadeInSamples > 0) {
-      const nIn = Math.min(fadeInSamples, outputFrames);
-      const scaleEnd = nIn / fadeInSamples;
-      for (let f = 0; f < nIn; f++) {
-        const gain = nIn > 1 ? (f / (nIn - 1)) * scaleEnd : 0.0;
-        const off = f * channels;
-        for (let ch = 0; ch < channels; ch++) {
-          out[off + ch] = clampInt16(out[off + ch] * gain);
-        }
-      }
-    }
-
-    const fadeOutSamples = Math.max(0, Math.round((edgeFadeOutMs / 1000.0) * sampleRate));
-    if (fadeOutSamples > 0) {
-      const nOut = Math.min(fadeOutSamples, outputFrames);
-      if (nOut > 1) {
-        const startF = outputFrames - nOut;
-        for (let f = 0; f < nOut; f++) {
-          const gain = 1.0 - f / (nOut - 1);
-          const off = (startF + f) * channels;
-          for (let ch = 0; ch < channels; ch++) {
-            out[off + ch] = clampInt16(out[off + ch] * gain);
-          }
-        }
-      }
-    }
-  }
-
-  return {
-    pcm: out,
-    frames: outputFrames,
-    duration: outputFrames / sampleRate,
+  return renderStreamItemsInt16({
+    items: streamItems,
     sampleRate,
     channels,
-  };
+    crossfadeMs: effCrossfadeMs,
+    fadeEdges: effFadeEdges,
+    edgeFadeInMs,
+    edgeFadeOutMs,
+  });
 }
 
 /**
@@ -1296,122 +1198,36 @@ export function resolveEffectiveRanges(ranges, totalDuration, rangeAction = "kee
 }
 
 /**
- * Decide how to proceed after VAD analysis across `effectiveRanges`.
+ * Step 2 decision for Prayer Mode's single-stream VAD pass over the Step 1 pure montage.
  *
- * - Normal Mode (or Prayer Mode with no user ranges): preserves exact safety-guard
- *   abort on `low_snr_guarded` and throws `NO_SPEECH_DETECTED` if any range is empty.
- * - Prayer Mode with user ranges: NEVER discards the user's montage.
- *   - `silenceTrimStatus === "skipped"` (`silenceTrimSkipped === true`): ONLY when ALL
- *     ranges skipped automatic silence trimming (so ONLY user ranges are kept/removed).
- *   - `silenceTrimStatus === "partial"` (`silenceTrimSkipped === false`): some clean
- *     ranges had pauses trimmed while noisy/quiet ranges (>= 1.2s) were kept intact.
- *   - `silenceTrimStatus === "trimmed"` (`silenceTrimSkipped === false`): all ranges
- *     analyzed cleanly.
+ * - If `low_snr_guarded` triggers, or VAD detects 0 speech segments, or no long silences
+ *   were cut (single segment covering the whole montage), skips silence trimming and
+ *   exports the Step 1 pure montage directly with `silenceTrimSkipped: true`.
+ * - Otherwise, proceeds with standard single-range `spliceRangesInt16` and reports
+ *   `silenceTrimSkipped: false` (`silenceTrimStatus: "trimmed"`).
  */
-export function applyPrayerModeFallback(
-  rangeResults,
-  effectiveRanges,
-  { isPrayerMode = false, hasUserRanges = false } = {}
-) {
-  const preserveMontage = Boolean(isPrayerMode && hasUserRanges);
+export function decidePrayerPostVad(vadResult, montageDuration) {
+  const dur = Math.max(0, Number(montageDuration) || 0);
+  const segs = vadResult?.segments;
+  const isGuarded = Boolean(vadResult?.low_snr_guarded);
+  const isEmpty = !Array.isArray(segs) || segs.length === 0;
+  const noLongSilencesFound =
+    Array.isArray(segs) &&
+    segs.length === 1 &&
+    segs[0].start <= 0.05 &&
+    segs[0].end >= Math.max(0, dur - 0.05);
 
-  if (!preserveMontage) {
-    const allGuarded = rangeResults.every((r) => Boolean(r.low_snr_guarded));
-    if (allGuarded) {
-      return {
-        action: "abort_low_snr",
-        rangeResults,
-        silenceTrimSkipped: false,
-        silenceTrimStatus: "skipped",
-        skippedRangesCount: rangeResults.length,
-        totalRangesCount: rangeResults.length,
-      };
-    }
-    if (rangeResults.some((r) => !r.segments || r.segments.length === 0)) {
-      throw new Error("NO_SPEECH_DETECTED");
-    }
+  if (isGuarded || isEmpty || noLongSilencesFound) {
     return {
-      action: "splice",
-      rangeResults,
-      silenceTrimSkipped: false,
-      silenceTrimStatus: "trimmed",
-      skippedRangesCount: 0,
-      totalRangesCount: rangeResults.length,
+      skipSilenceTrim: true,
+      silenceTrimSkipped: true,
+      silenceTrimStatus: "skipped",
     };
-  }
-
-  // Sub-1.2s residual edge slivers cannot have >= 1.2s silences cut by VAD anyway;
-  // keep them intact without misreporting a noisy-section notice when other ranges are clean.
-  const MIN_TRIMMABLE_RANGE_S = 1.2;
-  const EDGE_GUARD_SNAP_S = 1.2;
-  let skippedAnyCount = 0;
-  let skippedSignificantCount = 0;
-  let cleanCount = 0;
-
-  const adjusted = rangeResults.map((res, idx) => {
-    const eff = effectiveRanges[idx];
-    const dur = Math.max(0.0, eff.endS - eff.startS);
-    const isGuarded = Boolean(res.low_snr_guarded);
-    const isEmpty = !res.segments || res.segments.length === 0;
-    if (!isGuarded && !isEmpty) {
-      cleanCount += 1;
-      // Preserve full edge margin at tight user cut boundaries so VAD never clips
-      // a quiet initial consonant or trailing letter right at the user's timestamp.
-      const segs = res.segments.map((s) => ({ ...s }));
-      if (segs.length > 0) {
-        const first = segs[0];
-        if (first.start > eff.startS && first.start - eff.startS <= EDGE_GUARD_SNAP_S) {
-          first.start = eff.startS;
-          first.duration = Math.max(0.0, Number((first.end - first.start).toFixed(4)));
-        }
-        const last = segs[segs.length - 1];
-        if (last.end < eff.endS && eff.endS - last.end <= EDGE_GUARD_SNAP_S) {
-          last.end = eff.endS;
-          last.duration = Math.max(0.0, Number((last.end - last.start).toFixed(4)));
-        }
-      }
-      return {
-        ...res,
-        segments: segs,
-      };
-    }
-    skippedAnyCount += 1;
-    if (effectiveRanges.length === 1 || dur >= MIN_TRIMMABLE_RANGE_S) {
-      skippedSignificantCount += 1;
-    }
-    return {
-      ...res,
-      segments: [
-        {
-          start: eff.startS,
-          end: eff.endS,
-          duration: dur,
-        },
-      ],
-      // Non-overlapping inter-range joins use 12 ms micro-fades + natural pause in spliceRangesInt16
-      resolved_crossfade_ms: 0,
-      resolved_gap_ms: 0,
-      use_room_tone: Boolean(
-        res.use_room_tone || (res.profile?.noise_floor_p5_db ?? -60.0) > -50.0
-      ),
-      direct_overlap: false,
-    };
-  });
-
-  const allSkipped = skippedAnyCount === rangeResults.length;
-  let silenceTrimStatus = "trimmed";
-  if (allSkipped) {
-    silenceTrimStatus = "skipped";
-  } else if (skippedSignificantCount > 0 && cleanCount > 0) {
-    silenceTrimStatus = "partial";
   }
 
   return {
-    action: "splice",
-    rangeResults: adjusted,
-    silenceTrimSkipped: allSkipped,
-    silenceTrimStatus,
-    skippedRangesCount: skippedSignificantCount,
-    totalRangesCount: rangeResults.length,
+    skipSilenceTrim: false,
+    silenceTrimSkipped: false,
+    silenceTrimStatus: "trimmed",
   };
 }

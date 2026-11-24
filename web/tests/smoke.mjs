@@ -10,7 +10,9 @@ import { fileURLToPath } from "node:url";
 import { WEB3FORMS_ACCESS_KEY } from "../config.js";
 import { createStaticServer } from "../dev-server.mjs";
 import {
-  applyPrayerModeFallback,
+  MONTAGE_DECLICK_MS,
+  buildMontageInt16,
+  decidePrayerPostVad,
   formatTimestampDigits,
   formatTimestampOnBlur,
   resolveEffectiveRanges,
@@ -262,243 +264,152 @@ function checkPrayerModeLogic() {
     /ALL_AUDIO_REMOVED/
   );
 
-  // 6. Normal Mode: low_snr_guarded aborts cleanly (unchanged)
-  const guardedRes = [
-    {
-      segments: [{ start: 0, end: 120, duration: 120 }],
-      total_duration: 120,
-      low_snr_guarded: true,
-      resolved_crossfade_ms: 0,
-      resolved_gap_ms: 0,
-    },
-  ];
-  const normalDecision = applyPrayerModeFallback(
-    guardedRes,
-    [{ startS: 0, endS: 120 }],
-    { isPrayerMode: false, hasUserRanges: false }
-  );
-  assert.equal(normalDecision.action, "abort_low_snr");
-  assert.equal(normalDecision.silenceTrimSkipped, false);
+  // 6. Step 1 Pure Montage on MONO PCM: exact straight concatenation (NO 400ms gap, NO crossfade)
+  //    with 5 ms de-click micro-fade at raw cut boundaries
+  const monoSr = 8000;
+  const monoDurS = 8;
+  const monoPcm = new Int16Array(monoSr * monoDurS);
+  // [0..2s]: +12000; [2..5s] (removed): -25000; [5..8s]: +20000
+  for (let i = 0; i < monoSr * 2; i++) monoPcm[i] = 12000;
+  for (let i = monoSr * 2; i < monoSr * 5; i++) monoPcm[i] = -25000;
+  for (let i = monoSr * 5; i < monoSr * 8; i++) monoPcm[i] = 20000;
 
-  // 7. Prayer Mode with user ranges: NEVER discards montage on low_snr_guarded or empty VAD
-  const prayerRanges = [
-    { startS: 0, endS: 60 },
-    { startS: 120, endS: 300 },
-  ];
-  const prayerVad = [
-    {
-      segments: [{ start: 0, end: 60, duration: 60 }],
-      total_duration: 60,
-      low_snr_guarded: true,
-      resolved_crossfade_ms: 0,
-      resolved_gap_ms: 0,
-    },
-    {
-      segments: [],
-      total_duration: 180,
-      low_snr_guarded: false,
-      resolved_crossfade_ms: 0,
-      resolved_gap_ms: 0,
-    },
-  ];
-  const prayerDecision = applyPrayerModeFallback(prayerVad, prayerRanges, {
-    isPrayerMode: true,
-    hasUserRanges: true,
-  });
-  assert.equal(prayerDecision.action, "splice");
-  assert.equal(prayerDecision.silenceTrimSkipped, true);
-  assert.equal(prayerDecision.silenceTrimStatus, "skipped");
-  assert.equal(prayerDecision.rangeResults.length, 2);
-  assert.deepEqual(prayerDecision.rangeResults[0].segments, [
-    { start: 0, end: 60, duration: 60 },
-  ]);
-  assert.deepEqual(prayerDecision.rangeResults[1].segments, [
-    { start: 120, end: 300, duration: 180 },
-  ]);
-  assert.equal(prayerDecision.rangeResults[0].resolved_crossfade_ms, 0);
-
-  // 8. Prayer Mode partial skip (1 noisy range + 1 clean trimmed range) must NOT set silenceTrimSkipped=true
-  const partialDecision = applyPrayerModeFallback(
-    [
-      {
-        segments: [{ start: 0, end: 60, duration: 60 }],
-        total_duration: 60,
-        low_snr_guarded: true,
-        resolved_crossfade_ms: 0,
-        resolved_gap_ms: 0,
-      },
-      {
-        segments: [{ start: 120, end: 250, duration: 130 }],
-        total_duration: 180,
-        low_snr_guarded: false,
-        resolved_crossfade_ms: 100,
-        resolved_gap_ms: 100,
-      },
-    ],
-    prayerRanges,
-    { isPrayerMode: true, hasUserRanges: true }
-  );
-  assert.equal(partialDecision.action, "splice");
-  assert.equal(partialDecision.silenceTrimSkipped, false);
-  assert.equal(partialDecision.silenceTrimStatus, "partial");
-  assert.equal(partialDecision.skippedRangesCount, 1);
-
-  // 9. Tiny (<1.2s) edge sliver hitting low_snr_guarded while main recitation is clean must NOT show noise notice
-  const sliverDecision = applyPrayerModeFallback(
-    [
-      {
-        segments: [{ start: 0, end: 0.4, duration: 0.4 }],
-        total_duration: 0.4,
-        low_snr_guarded: true,
-        resolved_crossfade_ms: 0,
-        resolved_gap_ms: 0,
-      },
-      {
-        segments: [{ start: 45, end: 2100, duration: 2055 }],
-        total_duration: 2219,
-        low_snr_guarded: false,
-        resolved_crossfade_ms: 100,
-        resolved_gap_ms: 100,
-      },
-    ],
-    [
-      { startS: 0, endS: 0.4 },
-      { startS: 45, endS: 2264 },
-    ],
-    { isPrayerMode: true, hasUserRanges: true }
-  );
-  assert.equal(sliverDecision.action, "splice");
-  assert.equal(sliverDecision.silenceTrimSkipped, false);
-  assert.equal(sliverDecision.silenceTrimStatus, "trimmed");
-
-  // 10. End-to-end saved-duration accuracy when silenceTrimSkipped === true
-  const sr = 8000;
-  const origDurS = 10;
-  const pcm = new Int16Array(sr * origDurS);
-  const effAfterRemove = resolveEffectiveRanges(
-    [{ startS: 0, endS: 2 }],
-    origDurS,
-    "remove"
-  );
-  const fullSkipDecision = applyPrayerModeFallback(
-    [
-      {
-        segments: [{ start: 2, end: 10, duration: 8 }],
-        total_duration: 8,
-        low_snr_guarded: true,
-        resolved_crossfade_ms: 0,
-        resolved_gap_ms: 0,
-      },
-    ],
-    effAfterRemove,
-    { isPrayerMode: true, hasUserRanges: true }
-  );
-  assert.equal(fullSkipDecision.silenceTrimSkipped, true);
-  assert.equal(fullSkipDecision.silenceTrimStatus, "skipped");
-  const spliced = spliceRangesInt16({
-    pcm,
-    sampleRate: sr,
+  const monoKept = resolveEffectiveRanges([{ startS: 2, endS: 5 }], monoDurS, "remove");
+  const monoMontage = buildMontageInt16({
+    pcm: monoPcm,
+    sampleRate: monoSr,
     channels: 1,
-    rangeResults: fullSkipDecision.rangeResults,
+    keptRanges: monoKept,
+    declickMs: MONTAGE_DECLICK_MS,
   });
-  const savedDuration = origDurS - spliced.duration;
+  // Exact straight montage duration: 2.0s + 3.0s = 5.000s (zero synthetic 400ms gap!)
   assert.ok(
-    Math.abs(spliced.duration - 8.0) < 0.01,
-    `Expected 8.0s exported duration, got ${spliced.duration}`
+    Math.abs(monoMontage.duration - 5.0) < 0.001,
+    `Expected pure 5.000s mono montage, got ${monoMontage.duration}`
   );
-  assert.ok(
-    Math.abs(savedDuration - 2.0) < 0.01,
-    `Expected 2.0s saved duration (matching only removed range), got ${savedDuration}`
-  );
-
-  // 11. Prayer Mode with clean speech segments does NOT show skipped notice
-  const cleanPrayerVad = [
-    {
-      segments: [{ start: 1, end: 59, duration: 58 }],
-      total_duration: 60,
-      low_snr_guarded: false,
-      resolved_crossfade_ms: 100,
-      resolved_gap_ms: 100,
-    },
-  ];
-  const cleanDecision = applyPrayerModeFallback(
-    cleanPrayerVad,
-    [{ startS: 0, endS: 60 }],
-    { isPrayerMode: true, hasUserRanges: true }
-  );
-  assert.equal(cleanDecision.action, "splice");
-  assert.equal(cleanDecision.silenceTrimSkipped, false);
-  assert.equal(cleanDecision.silenceTrimStatus, "trimmed");
-  // Tight edge within 1.2s of user boundary is snapped to preserve initial/final consonants
-  assert.equal(cleanDecision.rangeResults[0].segments[0].start, 0);
-  assert.equal(cleanDecision.rangeResults[0].segments[0].end, 60);
-
-  // 12. Long silence (>1.2s) at start of a Prayer Mode range is still trimmed by VAD
-  const longLeadSilenceDecision = applyPrayerModeFallback(
-    [
-      {
-        segments: [{ start: 105.0, end: 155.0, duration: 50.0 }],
-        total_duration: 60,
-        low_snr_guarded: false,
-        resolved_crossfade_ms: 150,
-        resolved_gap_ms: 0,
-      },
-    ],
-    [{ startS: 100.0, endS: 160.0 }],
-    { isPrayerMode: true, hasUserRanges: true }
-  );
-  assert.equal(longLeadSilenceDecision.rangeResults[0].segments[0].start, 105.0);
-  assert.equal(longLeadSilenceDecision.rangeResults[0].segments[0].end, 155.0);
-
-  // 13. Non-overlapping Prayer Mode join preserves exact start of incoming clip
-  //     (12 ms de-click micro-fade + 400 ms pause, ZERO 80 ms crossfade overlap)
-  const joinSr = 8000;
-  const joinPcm = new Int16Array(joinSr * 8);
-  // Range 1 [0s..2s]: constant +12000; Excluded [2s..5s]: -25000 (must NEVER bleed in!);
-  // Range 2 [5s..7s]: constant +20000 starting right at sample 0 of t=5.000s (tight consonant onset)
-  for (let i = 0; i < joinSr * 2; i++) joinPcm[i] = 12000;
-  for (let i = joinSr * 2; i < joinSr * 5; i++) joinPcm[i] = -25000;
-  for (let i = joinSr * 5; i < joinSr * 7; i++) joinPcm[i] = 20000;
-
-  const joined = spliceRangesInt16({
-    pcm: joinPcm,
-    sampleRate: joinSr,
-    channels: 1,
-    fadeEdges: false,
-    rangeResults: [
-      {
-        segments: [{ start: 0.0, end: 2.0, duration: 2.0 }],
-        resolved_crossfade_ms: 150,
-        resolved_gap_ms: 0,
-        use_room_tone: false,
-        low_snr_guarded: false,
-      },
-      {
-        segments: [{ start: 5.0, end: 7.0, duration: 2.0 }],
-        resolved_crossfade_ms: 150,
-        resolved_gap_ms: 0,
-        use_room_tone: false,
-        low_snr_guarded: false,
-      },
-    ],
-  });
-
-  // Exact non-overlapping duration: 2.0s + 0.400s pause + 2.0s = 4.400s
-  assert.ok(
-    Math.abs(joined.duration - 4.4) < 0.002,
-    `Expected non-overlapping 4.400s duration, got ${joined.duration}`
-  );
-  // Excluded region (-25000) must never bleed past Range 1's end (no tail extension!)
-  for (let i = 0; i < joined.pcm.length; i++) {
-    assert.ok(joined.pcm[i] >= 0, `Excluded audio leaked into output at sample ${i}: ${joined.pcm[i]}`);
+  // Excluded region (-25000) must NEVER appear
+  for (let i = 0; i < monoMontage.pcm.length; i++) {
+    assert.ok(monoMontage.pcm[i] >= 0, `Excluded mono audio leaked at ${i}: ${monoMontage.pcm[i]}`);
   }
-  // Mid-pause (t = 2.200s) is quiet (0 for studio silence)
-  assert.equal(joined.pcm[Math.round(2.2 * joinSr)], 0);
-  // Incoming Range 2 starts at t = 2.400s: sample 0 is de-clicked (0), and by 15 ms (t = 2.415s)
-  // it is ALREADY at 100% untouched full amplitude (+20000), proving zero 80-150ms consonant clipping!
-  const range2Start = Math.round(2.4 * joinSr);
-  assert.equal(joined.pcm[range2Start], 0);
-  assert.equal(joined.pcm[range2Start + Math.round(0.015 * joinSr)], 20000);
+  // Seam at frame 2.0s: zero digital pop (0 -> 0 across the cut) and full +20000 by 6 ms after seam!
+  const monoSeam = monoSr * 2;
+  assert.equal(monoMontage.pcm[monoSeam - 1], 0);
+  assert.equal(monoMontage.pcm[monoSeam], 0);
+  assert.equal(monoMontage.pcm[monoSeam + Math.round(0.006 * monoSr)], 20000);
+  // Untouched outer start (frame 0) and outer end (last frame) remain full amplitude (no unnecessary fade)
+  assert.equal(monoMontage.pcm[0], 12000);
+  assert.equal(monoMontage.pcm[monoMontage.frames - 1], 20000);
+
+  // 7. Step 1 Pure Montage on STEREO PCM: exact interleaved L/R alignment, zero channel swap,
+  //    zero synthetic gap, zero amplitude spikes/thumps at the seam
+  const stSr = 16000;
+  const stDurS = 7;
+  const stChannels = 2;
+  const stPcm = new Int16Array(stSr * stDurS * stChannels);
+  for (let f = 0; f < stSr * stDurS; f++) {
+    const off = f * stChannels;
+    if (f < stSr * 2) {
+      // Range 1 [0..2s]: L = +14000, R = -11000
+      stPcm[off] = 14000;
+      stPcm[off + 1] = -11000;
+    } else if (f < stSr * 5) {
+      // Excluded [2..5s]: L = -30000, R = +30000 (must never bleed in)
+      stPcm[off] = -30000;
+      stPcm[off + 1] = 30000;
+    } else {
+      // Range 2 [5..7s]: L = +18000, R = -21000
+      stPcm[off] = 18000;
+      stPcm[off + 1] = -21000;
+    }
+  }
+  const stKept = resolveEffectiveRanges([{ startS: 2, endS: 5 }], stDurS, "remove");
+  const stMontage = buildMontageInt16({
+    pcm: stPcm,
+    sampleRate: stSr,
+    channels: stChannels,
+    keptRanges: stKept,
+    declickMs: MONTAGE_DECLICK_MS,
+  });
+  assert.equal(stMontage.frames, stSr * 4);
+  assert.equal(stMontage.pcm.length, stSr * 4 * stChannels);
+  assert.ok(Math.abs(stMontage.duration - 4.0) < 0.001);
+
+  // Verify strict L/R channel alignment across entire stereo output (L >= 0, R <= 0 everywhere!)
+  for (let f = 0; f < stMontage.frames; f++) {
+    const l = stMontage.pcm[f * 2];
+    const r = stMontage.pcm[f * 2 + 1];
+    assert.ok(l >= 0 && l <= 18000, `Stereo L channel misaligned/spiked at frame ${f}: ${l}`);
+    assert.ok(r <= 0 && r >= -21000, `Stereo R channel misaligned/spiked at frame ${f}: ${r}`);
+  }
+  // Verify smooth 5 ms seam de-click (zero step jump at seamFrame, full L/R by 6 ms)
+  const stSeam = stSr * 2;
+  assert.equal(stMontage.pcm[(stSeam - 1) * 2], 0);
+  assert.equal(stMontage.pcm[(stSeam - 1) * 2 + 1], 0);
+  assert.equal(stMontage.pcm[stSeam * 2], 0);
+  assert.equal(stMontage.pcm[stSeam * 2 + 1], 0);
+  const afterSeam = stSeam + Math.round(0.006 * stSr);
+  assert.equal(stMontage.pcm[afterSeam * 2], 18000);
+  assert.equal(stMontage.pcm[afterSeam * 2 + 1], -21000);
+  // Max sample-to-sample step across the seam window must be smooth (< 1000), zero bang/thump
+  const seamWin = Math.round(0.01 * stSr);
+  for (let f = stSeam - seamWin; f < stSeam + seamWin; f++) {
+    const dl = Math.abs(stMontage.pcm[f * 2] - stMontage.pcm[(f - 1) * 2]);
+    const dr = Math.abs(stMontage.pcm[f * 2 + 1] - stMontage.pcm[(f - 1) * 2 + 1]);
+    assert.ok(dl < 1000 && dr < 1000, `Sharp discontinuity at stereo seam frame ${f}: dl=${dl}, dr=${dr}`);
+  }
+
+  // 8. Step 2 Single-Stream VAD Decision: fallback to Step 1 pure montage on low_snr_guarded,
+  //    empty segments, or no long silences found
+  const noisyDecision = decidePrayerPostVad(
+    { low_snr_guarded: true, segments: [{ start: 0, end: 4, duration: 4 }] },
+    4.0
+  );
+  assert.deepEqual(noisyDecision, {
+    skipSilenceTrim: true,
+    silenceTrimSkipped: true,
+    silenceTrimStatus: "skipped",
+  });
+  // Saved duration when skipped equals exact difference between original file and Step 1 pure montage
+  assert.ok(Math.abs((stDurS - stMontage.duration) - 3.0) < 0.001);
+
+  const emptyDecision = decidePrayerPostVad({ low_snr_guarded: false, segments: [] }, 4.0);
+  assert.equal(emptyDecision.skipSilenceTrim, true);
+  assert.equal(emptyDecision.silenceTrimSkipped, true);
+
+  const noLongSilencesDecision = decidePrayerPostVad(
+    { low_snr_guarded: false, segments: [{ start: 0.0, end: 4.0, duration: 4.0 }] },
+    4.0
+  );
+  assert.equal(noLongSilencesDecision.skipSilenceTrim, true);
+  assert.equal(noLongSilencesDecision.silenceTrimSkipped, true);
+
+  // 9. Step 2 Single-Stream Silence Trimming on the Step 1 montage (clean audio with long silence)
+  const cleanVadOnMontage = {
+    low_snr_guarded: false,
+    segments: [
+      { start: 0.0, end: 1.5, duration: 1.5 },
+      { start: 2.5, end: 4.0, duration: 1.5 },
+    ],
+    resolved_crossfade_ms: 0,
+    resolved_gap_ms: 0,
+    use_room_tone: false,
+  };
+  const trimmedDecision = decidePrayerPostVad(cleanVadOnMontage, stMontage.duration);
+  assert.deepEqual(trimmedDecision, {
+    skipSilenceTrim: false,
+    silenceTrimSkipped: false,
+    silenceTrimStatus: "trimmed",
+  });
+  const finalStereo = spliceRangesInt16({
+    pcm: stMontage.pcm,
+    sampleRate: stSr,
+    channels: stChannels,
+    rangeResults: [cleanVadOnMontage],
+    fadeEdges: false,
+  });
+  // Original 7.0s -> Step 1 montage 4.0s (-3.0s) -> Step 2 VAD trimmed 3.0s (-1.0s) => 4.0s total saved
+  assert.ok(Math.abs(finalStereo.duration - 3.0) < 0.002);
+  assert.ok(Math.abs((stDurS - finalStereo.duration) - 4.0) < 0.002);
 }
 
 async function checkDevServer() {

@@ -23,10 +23,11 @@ import {
 import {
   EDGE_FADE_IN_MS,
   EDGE_FADE_OUT_MS,
-  INTER_RANGE_MICRO_FADE_MS,
   MIME_TYPES,
+  MONTAGE_DECLICK_MS,
   QUALITY_PRESETS,
-  applyPrayerModeFallback,
+  buildMontageInt16,
+  decidePrayerPostVad,
   encodeWavInt16,
   isLosslessSource,
   resolveEffectiveRanges,
@@ -382,97 +383,132 @@ self.onmessage = async (event) => {
       coreMode: loadedMode,
     });
 
-    postProgress("analyzing", 35);
-    let vadAudio16k = buildVadAudio16k(
-      nativePcm,
-      sampleRate,
-      channels,
-      frames,
-      useHeadroom ? 2.0 : 1.0
-    );
-
     const hasUserRanges = Array.isArray(ranges) && ranges.length > 0;
     const isPrayerMode = mode === "prayer";
-    const effectiveRanges = resolveEffectiveRanges(
-      hasUserRanges ? ranges : [],
-      totalDuration,
-      isPrayerMode ? rangeAction : "keep"
-    );
+    const originalDuration = totalDuration;
 
-    const rangeResults = [];
-    for (let rIdx = 0; rIdx < effectiveRanges.length; rIdx++) {
-      const r = effectiveRanges[rIdx];
-      const clipStart = r.startS;
-      const clipEnd = r.endS;
-      const clipDuration = clipEnd - clipStart;
-      const s16k = Math.max(0, Math.round(clipStart * VAD_SAMPLE_RATE));
-      const e16k = Math.min(
-        vadAudio16k.length,
-        Math.max(s16k + 1, Math.round(clipEnd * VAD_SAMPLE_RATE))
+    let finalPcm = null;
+    let finalDuration = 0;
+    let silenceTrimSkipped = false;
+    let silenceTrimStatus = "trimmed";
+
+    if (isPrayerMode && hasUserRanges) {
+      // Step 1: Pure straight montage (exact frame/channel alignment + 5 ms de-click micro-fades)
+      postProgress("analyzing", 35);
+      const effectiveRanges = resolveEffectiveRanges(
+        ranges,
+        totalDuration,
+        rangeAction
       );
-      const slice16k = vadAudio16k.subarray(s16k, e16k);
+      let montage = buildMontageInt16({
+        pcm: nativePcm,
+        sampleRate,
+        channels,
+        keptRanges: effectiveRanges,
+        declickMs: MONTAGE_DECLICK_MS,
+      });
+      // Release original full-length PCM immediately after creating the montage
+      nativePcm = null;
 
-      const rangeBasePct = 36 + (rIdx / effectiveRanges.length) * 28;
-      const rangeSpanPct = 28 / effectiveRanges.length;
-
+      // Step 2: Run the exact same single-stream Normal Mode VAD + splicer on the montage
+      let vadAudio16k = buildVadAudio16k(
+        montage.pcm,
+        sampleRate,
+        channels,
+        montage.frames,
+        useHeadroom ? 2.0 : 1.0
+      );
       const vadRes = detectSpeechSegments(
-        slice16k,
+        vadAudio16k,
         {},
         {
-          exactDuration: clipDuration,
-          clipStartS: clipStart,
-          progressCb: (frac) =>
-            postProgress("analyzing", rangeBasePct + frac * rangeSpanPct),
+          exactDuration: montage.duration,
+          clipStartS: 0.0,
+          progressCb: (frac) => postProgress("analyzing", 36 + frac * 28),
         }
       );
-      rangeResults.push(vadRes);
-    }
+      vadAudio16k = null;
 
-    // Release 16 kHz analysis buffer immediately
-    vadAudio16k = null;
+      const decision = decidePrayerPostVad(vadRes, montage.duration);
+      silenceTrimSkipped = decision.silenceTrimSkipped;
+      silenceTrimStatus = decision.silenceTrimStatus;
 
-    const decision = applyPrayerModeFallback(rangeResults, effectiveRanges, {
-      isPrayerMode,
-      hasUserRanges,
-    });
+      postProgress("splicing", 66);
+      if (decision.skipSilenceTrim) {
+        // Export Step 1 pure montage directly (never discard user's Prayer Mode montage)
+        finalPcm = montage.pcm;
+        finalDuration = montage.duration;
+        montage = null;
+      } else {
+        const trimmedStart = effectiveRanges[0].startS > 0.05;
+        const trimmedEnd =
+          effectiveRanges[effectiveRanges.length - 1].endS < totalDuration - 0.05;
+        let spliced = spliceRangesInt16({
+          pcm: montage.pcm,
+          sampleRate,
+          channels,
+          rangeResults: [vadRes],
+          edgeFadeInMs: trimmedStart ? MONTAGE_DECLICK_MS : EDGE_FADE_IN_MS,
+          edgeFadeOutMs: trimmedEnd ? MONTAGE_DECLICK_MS : EDGE_FADE_OUT_MS,
+        });
+        montage = null;
+        finalPcm = spliced.pcm;
+        finalDuration = spliced.duration;
+        spliced = null;
+      }
+    } else {
+      // Standard Normal Mode (exact single-stream behavior, unchanged)
+      postProgress("analyzing", 35);
+      let vadAudio16k = buildVadAudio16k(
+        nativePcm,
+        sampleRate,
+        channels,
+        frames,
+        useHeadroom ? 2.0 : 1.0
+      );
+      const vadRes = detectSpeechSegments(
+        vadAudio16k,
+        {},
+        {
+          exactDuration: totalDuration,
+          clipStartS: 0.0,
+          progressCb: (frac) => postProgress("analyzing", 36 + frac * 28),
+        }
+      );
+      vadAudio16k = null;
 
-    if (decision.action === "abort_low_snr") {
-      nativePcm = null;
-      deleteFile(core, "meta.txt");
-      self.postMessage({
-        type: "low_snr_guarded",
-        originalDuration: totalDuration,
-        profile: rangeResults[0].profile,
+      if (vadRes.low_snr_guarded) {
+        nativePcm = null;
+        deleteFile(core, "meta.txt");
+        self.postMessage({
+          type: "low_snr_guarded",
+          originalDuration: totalDuration,
+          profile: vadRes.profile,
+        });
+        return;
+      }
+
+      if (!vadRes.segments || vadRes.segments.length === 0) {
+        nativePcm = null;
+        throw new Error("NO_SPEECH_DETECTED");
+      }
+
+      postProgress("splicing", 66);
+      let spliced = spliceRangesInt16({
+        pcm: nativePcm,
+        sampleRate,
+        channels,
+        rangeResults: [vadRes],
       });
-      return;
+      nativePcm = null;
+      finalPcm = spliced.pcm;
+      finalDuration = spliced.duration;
+      spliced = null;
     }
-
-    const silenceTrimSkipped = decision.silenceTrimSkipped;
-    const silenceTrimStatus = decision.silenceTrimStatus;
-
-    postProgress("splicing", 66);
-    const trimmedStart = isPrayerMode && hasUserRanges && effectiveRanges[0].startS > 0.05;
-    const trimmedEnd =
-      isPrayerMode &&
-      hasUserRanges &&
-      effectiveRanges[effectiveRanges.length - 1].endS < totalDuration - 0.05;
-    let spliced = spliceRangesInt16({
-      pcm: nativePcm,
-      sampleRate,
-      channels,
-      rangeResults: decision.rangeResults,
-      edgeFadeInMs: trimmedStart ? INTER_RANGE_MICRO_FADE_MS : EDGE_FADE_IN_MS,
-      edgeFadeOutMs: trimmedEnd ? INTER_RANGE_MICRO_FADE_MS : EDGE_FADE_OUT_MS,
-    });
-    // Aggressively release large native PCM buffer before creating output WAV
-    nativePcm = null;
-
-    const originalDuration = totalDuration;
-    const finalDuration = spliced.duration;
 
     postProgress("exporting", 80);
-    let wavOutBuf = encodeWavInt16(spliced.pcm, sampleRate, channels);
-    spliced = null;
+    let wavOutBuf = encodeWavInt16(finalPcm, sampleRate, channels);
+    finalPcm = null;
 
     if (quality === "lossless_wav") {
       deleteFile(core, "meta.txt");
