@@ -386,6 +386,37 @@ a:focus-visible {
   gap: 0.75rem;
 }
 
+.range-action-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.25rem;
+  padding: 0.22rem;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.range-action-btn {
+  border: none;
+  border-radius: 8px;
+  padding: 0.45rem 0.6rem;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.83rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.range-action-btn:hover:not(.is-active) {
+  color: var(--text);
+}
+
+.range-action-btn.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .trim-hint {
   margin: 0;
   font-size: 0.82rem;
@@ -589,6 +620,18 @@ a:focus-visible {
   border: 1px solid var(--border);
   color: var(--text-muted);
   font-size: 0.84rem;
+}
+
+.result-notice {
+  margin: 0;
+  width: 100%;
+  padding: 0.7rem 0.95rem;
+  border-radius: 10px;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  text-align: center;
 }
 
 .status-badge {

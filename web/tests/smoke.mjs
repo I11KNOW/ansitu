@@ -10,6 +10,10 @@ import { fileURLToPath } from "node:url";
 import { WEB3FORMS_ACCESS_KEY } from "../config.js";
 import { createStaticServer } from "../dev-server.mjs";
 import {
+  applyPrayerModeFallback,
+  resolveEffectiveRanges,
+} from "../engine/splicer.js";
+import {
   TRANSLATIONS,
   buildOutputFilename,
   formatClock,
@@ -140,6 +144,17 @@ function checkI18nAndHtmlRules() {
   assert.ok(html.includes('id="view-low-snr"'));
   assert.ok(html.includes('id="tab-standard"'));
   assert.ok(html.includes('id="tab-prayer"'));
+  assert.ok(html.includes('id="range-action-remove"'));
+  assert.ok(html.includes('id="range-action-keep"'));
+  assert.ok(html.includes('id="result-notice"'));
+  assert.equal(ar.rangeActionRemove, "حذف هذه المقاطع");
+  assert.equal(ar.rangeActionKeep, "الاحتفاظ بهذه المقاطع فقط");
+  assert.equal(en.rangeActionRemove, "Remove these ranges");
+  assert.equal(en.rangeActionKeep, "Keep only these ranges");
+  assert.ok(ar.resultSilenceSkippedNotice.length > 20);
+  assert.ok(en.resultSilenceSkippedNotice.length > 20);
+  assert.ok(ar.errors.allAudioRemoved.length > 10);
+  assert.ok(en.errors.allAudioRemoved.length > 10);
   assert.ok(html.includes("تنقية التلاوة"));
   assert.ok(!html.includes('id="trim-toggle"'));
   assert.ok(!html.includes('id="sample-btn"'), "index.html must not contain #sample-btn");
@@ -166,6 +181,133 @@ function checkI18nAndHtmlRules() {
   assert.ok(!/\.onnx\b/i.test(shellBlock), "sw.js SHELL_ASSETS must not pre-cache ONNX models");
   assert.ok(!shellBlock.includes("og-preview.png"), "sw.js SHELL_ASSETS must not pre-cache og-preview.png");
   assert.ok(!/fonts\.googleapis\.com/i.test(html), "index.html should not block paint with external font stylesheets");
+}
+
+function checkPrayerModeLogic() {
+  // 1. Keep mode (existing behavior)
+  assert.deepEqual(
+    resolveEffectiveRanges([{ startS: 10, endS: 50 }, { startS: 120, endS: 400 }], 300, "keep"),
+    [{ startS: 10, endS: 50 }, { startS: 120, endS: 300 }]
+  );
+  assert.deepEqual(resolveEffectiveRanges([], 300, "remove"), [{ startS: 0, endS: 300 }]);
+
+  // 2. Remove mode: single middle cut (e.g., Ruku'/Sujud)
+  assert.deepEqual(
+    resolveEffectiveRanges([{ startS: 60, endS: 120 }], 300, "remove"),
+    [{ startS: 0, endS: 60 }, { startS: 120, endS: 300 }]
+  );
+
+  // 3. Remove mode: leading cut & trailing cut
+  assert.deepEqual(
+    resolveEffectiveRanges([{ startS: null, endS: 45 }], 300, "remove"),
+    [{ startS: 45, endS: 300 }]
+  );
+  assert.deepEqual(
+    resolveEffectiveRanges([{ startS: 250, endS: null }], 300, "remove"),
+    [{ startS: 0, endS: 250 }]
+  );
+
+  // 4. Remove mode: unsorted, overlapping, adjacent, and > duration clamping
+  assert.deepEqual(
+    resolveEffectiveRanges(
+      [
+        { startS: 100, endS: 150 },
+        { startS: 80, endS: 120 },
+        { startS: 150, endS: 180 },
+        { startS: 270, endS: 999 },
+      ],
+      300,
+      "remove"
+    ),
+    [{ startS: 0, endS: 80 }, { startS: 180, endS: 270 }]
+  );
+
+  // 5. Remove mode: removing entire file throws ALL_AUDIO_REMOVED
+  assert.throws(
+    () => resolveEffectiveRanges([{ startS: 0, endS: 300 }], 300, "remove"),
+    /ALL_AUDIO_REMOVED/
+  );
+  assert.throws(
+    () =>
+      resolveEffectiveRanges(
+        [{ startS: 0, endS: 150 }, { startS: 150, endS: 300 }],
+        300,
+        "remove"
+      ),
+    /ALL_AUDIO_REMOVED/
+  );
+
+  // 6. Normal Mode: low_snr_guarded aborts cleanly (unchanged)
+  const guardedRes = [
+    {
+      segments: [{ start: 0, end: 120, duration: 120 }],
+      total_duration: 120,
+      low_snr_guarded: true,
+      resolved_crossfade_ms: 0,
+      resolved_gap_ms: 0,
+    },
+  ];
+  const normalDecision = applyPrayerModeFallback(
+    guardedRes,
+    [{ startS: 0, endS: 120 }],
+    { isPrayerMode: false, hasUserRanges: false }
+  );
+  assert.equal(normalDecision.action, "abort_low_snr");
+  assert.equal(normalDecision.silenceTrimSkipped, false);
+
+  // 7. Prayer Mode with user ranges: NEVER discards montage on low_snr_guarded or empty VAD
+  const prayerRanges = [
+    { startS: 0, endS: 60 },
+    { startS: 120, endS: 300 },
+  ];
+  const prayerVad = [
+    {
+      segments: [{ start: 0, end: 60, duration: 60 }],
+      total_duration: 60,
+      low_snr_guarded: true,
+      resolved_crossfade_ms: 0,
+      resolved_gap_ms: 0,
+    },
+    {
+      segments: [],
+      total_duration: 180,
+      low_snr_guarded: false,
+      resolved_crossfade_ms: 0,
+      resolved_gap_ms: 0,
+    },
+  ];
+  const prayerDecision = applyPrayerModeFallback(prayerVad, prayerRanges, {
+    isPrayerMode: true,
+    hasUserRanges: true,
+  });
+  assert.equal(prayerDecision.action, "splice");
+  assert.equal(prayerDecision.silenceTrimSkipped, true);
+  assert.equal(prayerDecision.rangeResults.length, 2);
+  assert.deepEqual(prayerDecision.rangeResults[0].segments, [
+    { start: 0, end: 60, duration: 60 },
+  ]);
+  assert.deepEqual(prayerDecision.rangeResults[1].segments, [
+    { start: 120, end: 300, duration: 180 },
+  ]);
+  assert.equal(prayerDecision.rangeResults[0].resolved_crossfade_ms, 80);
+
+  // 8. Prayer Mode with clean speech segments does NOT show skipped notice
+  const cleanPrayerVad = [
+    {
+      segments: [{ start: 1, end: 59, duration: 58 }],
+      total_duration: 60,
+      low_snr_guarded: false,
+      resolved_crossfade_ms: 100,
+      resolved_gap_ms: 100,
+    },
+  ];
+  const cleanDecision = applyPrayerModeFallback(
+    cleanPrayerVad,
+    [{ startS: 0, endS: 60 }],
+    { isPrayerMode: true, hasUserRanges: true }
+  );
+  assert.equal(cleanDecision.action, "splice");
+  assert.equal(cleanDecision.silenceTrimSkipped, false);
 }
 
 async function checkDevServer() {
@@ -214,6 +356,7 @@ async function main() {
   checkHeadersFile();
   checkManifestAndAssets();
   checkI18nAndHtmlRules();
+  checkPrayerModeLogic();
   await checkDevServer();
   console.log("ALL STAGE 2 SMOKE TESTS PASSED.");
 }

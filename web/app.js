@@ -30,6 +30,7 @@ const state = {
   view: "input",
   selectedFile: null,
   mode: "standard",
+  rangeAction: "remove",
   ranges: [{ id: 1, start: "", end: "" }],
   nextRangeId: 2,
   worker: null,
@@ -81,6 +82,8 @@ const els = {
   tabStandard: document.getElementById("tab-standard"),
   tabPrayer: document.getElementById("tab-prayer"),
   trimPanel: document.getElementById("trim-panel"),
+  rangeActionRemove: document.getElementById("range-action-remove"),
+  rangeActionKeep: document.getElementById("range-action-keep"),
   trimHint: document.getElementById("trim-hint"),
   rangesList: document.getElementById("ranges-list"),
   addRangeBtn: document.getElementById("add-range-btn"),
@@ -98,6 +101,7 @@ const els = {
 
   resultTitle: document.getElementById("result-title"),
   resultSummary: document.getElementById("result-summary"),
+  resultNotice: document.getElementById("result-notice"),
   downloadBtn: document.getElementById("download-btn"),
   shareBtn: document.getElementById("share-btn"),
   anotherBtn: document.getElementById("another-btn"),
@@ -309,13 +313,24 @@ function renderRanges() {
 }
 
 function renderResultSummary() {
-  if (!state.lastResult) return;
+  if (!state.lastResult) {
+    els.resultNotice.hidden = true;
+    return;
+  }
   const orig = formatClock(state.lastResult.originalDuration);
   const fin = formatClock(state.lastResult.finalDuration);
   const saved = formatClock(
     Math.max(0, state.lastResult.originalDuration - state.lastResult.finalDuration)
   );
-  els.resultSummary.textContent = t().resultSummary(orig, fin, saved);
+  const tr = t();
+  els.resultSummary.textContent = tr.resultSummary(orig, fin, saved);
+  if (state.lastResult.silenceTrimSkipped) {
+    els.resultNotice.textContent = tr.resultSilenceSkippedNotice;
+    els.resultNotice.hidden = false;
+  } else {
+    els.resultNotice.hidden = true;
+    els.resultNotice.textContent = "";
+  }
 }
 
 function applyLanguage(lang) {
@@ -349,7 +364,10 @@ function applyLanguage(lang) {
   els.losslessHint.textContent = tr.losslessHint;
   els.tabStandard.textContent = tr.tabStandard;
   els.tabPrayer.textContent = tr.tabPrayer;
-  els.trimHint.textContent = tr.trimHint;
+  els.rangeActionRemove.textContent = tr.rangeActionRemove;
+  els.rangeActionKeep.textContent = tr.rangeActionKeep;
+  els.trimHint.textContent =
+    state.rangeAction === "keep" ? tr.trimHintKeep : tr.trimHintRemove;
   els.addRangeLabel.textContent = tr.addRange;
 
   els.processingStage.textContent =
@@ -412,6 +430,18 @@ function setMode(mode) {
   showInputError("");
 }
 
+function setRangeAction(action) {
+  const isKeep = action === "keep";
+  state.rangeAction = isKeep ? "keep" : "remove";
+  els.rangeActionRemove.classList.toggle("is-active", !isKeep);
+  els.rangeActionRemove.setAttribute("aria-checked", String(!isKeep));
+  els.rangeActionKeep.classList.toggle("is-active", isKeep);
+  els.rangeActionKeep.setAttribute("aria-checked", String(isKeep));
+  const tr = t();
+  els.trimHint.textContent = isKeep ? tr.trimHintKeep : tr.trimHintRemove;
+  showInputError("");
+}
+
 function collectValidatedRanges() {
   if (state.mode !== "prayer") {
     return [];
@@ -468,6 +498,8 @@ function mapWorkerError(code) {
       return errs.invalidRangeOrder;
     case "RANGE_EXCEEDS_DURATION":
       return errs.rangeExceedsDuration;
+    case "ALL_AUDIO_REMOVED":
+      return errs.allAudioRemoved;
     case "NO_SPEECH_DETECTED":
       return errs.noSpeechDetected;
     default:
@@ -548,6 +580,7 @@ async function startProcessing(file) {
         originalDuration: msg.originalDuration,
         finalDuration: msg.finalDuration,
         ext: msg.ext,
+        silenceTrimSkipped: Boolean(msg.silenceTrimSkipped),
       };
       els.downloadBtn.href = state.downloadUrl;
       els.downloadBtn.download = buildOutputFilename(file.name, msg.ext, msg.quality);
@@ -578,6 +611,8 @@ async function startProcessing(file) {
       outFormat: els.formatSelect.value,
       quality: els.qualitySelect.value,
       ranges: parsedRanges,
+      mode: state.mode,
+      rangeAction: state.rangeAction,
     },
     [buffer]
   );
@@ -808,6 +843,9 @@ function bindEvents() {
     });
   });
 
+  els.rangeActionRemove.addEventListener("click", () => setRangeAction("remove"));
+  els.rangeActionKeep.addEventListener("click", () => setRangeAction("keep"));
+
   els.addRangeBtn.addEventListener("click", () => {
     state.ranges.push({ id: state.nextRangeId++, start: "", end: "" });
     renderRanges();
@@ -833,6 +871,7 @@ function init() {
   applyTheme(state.theme);
   applyLanguage(state.lang);
   setMode("standard");
+  setRangeAction("remove");
   showView("input");
   bindEvents();
   setupPwaInstall();

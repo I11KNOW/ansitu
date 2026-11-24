@@ -23,8 +23,10 @@ import {
 import {
   MIME_TYPES,
   QUALITY_PRESETS,
+  applyPrayerModeFallback,
   encodeWavInt16,
   isLosslessSource,
+  resolveEffectiveRanges,
   spliceRangesInt16,
 } from "./engine/splicer.js";
 
@@ -310,6 +312,8 @@ self.onmessage = async (event) => {
     outFormat = "m4a",
     quality = "192",
     ranges = [],
+    mode = "standard",
+    rangeAction = "keep",
   } = msg;
 
   let core = null;
@@ -384,27 +388,19 @@ self.onmessage = async (event) => {
       useHeadroom ? 2.0 : 1.0
     );
 
-    const effectiveRanges =
-      Array.isArray(ranges) && ranges.length > 0
-        ? ranges
-        : [{ startS: null, endS: null }];
+    const hasUserRanges = Array.isArray(ranges) && ranges.length > 0;
+    const isPrayerMode = mode === "prayer";
+    const effectiveRanges = resolveEffectiveRanges(
+      hasUserRanges ? ranges : [],
+      totalDuration,
+      isPrayerMode ? rangeAction : "keep"
+    );
 
     const rangeResults = [];
     for (let rIdx = 0; rIdx < effectiveRanges.length; rIdx++) {
       const r = effectiveRanges[rIdx];
-      const clipStart = r.startS !== null && r.startS !== undefined ? Number(r.startS) : 0.0;
-      const clipEnd =
-        r.endS !== null && r.endS !== undefined
-          ? Math.min(Number(r.endS), totalDuration)
-          : totalDuration;
-
-      if (clipStart >= totalDuration) {
-        throw new Error("RANGE_EXCEEDS_DURATION");
-      }
-      if (clipStart >= clipEnd) {
-        throw new Error("INVALID_RANGE_ORDER");
-      }
-
+      const clipStart = r.startS;
+      const clipEnd = r.endS;
       const clipDuration = clipEnd - clipStart;
       const s16k = Math.max(0, Math.round(clipStart * VAD_SAMPLE_RATE));
       const e16k = Math.min(
@@ -432,37 +428,35 @@ self.onmessage = async (event) => {
     // Release 16 kHz analysis buffer immediately
     vadAudio16k = null;
 
-    const allGuarded = rangeResults.every((r) => Boolean(r.low_snr_guarded));
-    if (allGuarded) {
+    const decision = applyPrayerModeFallback(rangeResults, effectiveRanges, {
+      isPrayerMode,
+      hasUserRanges,
+    });
+
+    if (decision.action === "abort_low_snr") {
       nativePcm = null;
       deleteFile(core, "meta.txt");
       self.postMessage({
         type: "low_snr_guarded",
-        originalDuration: rangeResults.reduce((acc, r) => acc + r.total_duration, 0),
+        originalDuration: totalDuration,
         profile: rangeResults[0].profile,
       });
       return;
     }
 
-    if (rangeResults.some((r) => !r.segments || r.segments.length === 0)) {
-      nativePcm = null;
-      throw new Error("NO_SPEECH_DETECTED");
-    }
+    const silenceTrimSkipped = decision.silenceTrimSkipped;
 
     postProgress("splicing", 66);
     let spliced = spliceRangesInt16({
       pcm: nativePcm,
       sampleRate,
       channels,
-      rangeResults,
+      rangeResults: decision.rangeResults,
     });
     // Aggressively release large native PCM buffer before creating output WAV
     nativePcm = null;
 
-    const originalDuration = rangeResults.reduce(
-      (acc, r) => acc + r.total_duration,
-      0
-    );
+    const originalDuration = totalDuration;
     const finalDuration = spliced.duration;
 
     postProgress("exporting", 80);
@@ -481,6 +475,7 @@ self.onmessage = async (event) => {
           quality: "lossless_wav",
           originalDuration,
           finalDuration,
+          silenceTrimSkipped,
           coreMode: loadedMode,
         },
         [wavOutBuf]
@@ -543,6 +538,7 @@ self.onmessage = async (event) => {
         quality: String(bitrateKbps),
         originalDuration,
         finalDuration,
+        silenceTrimSkipped,
         coreMode: loadedMode,
       },
       [exactBuf]

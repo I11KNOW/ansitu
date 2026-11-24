@@ -38,8 +38,12 @@ export const TRANSLATIONS = {
     losslessHint: "سيتم التصدير بصيغة WAV غير مضغوطة مع الحفاظ على كامل الجودة الأصلية.",
     tabStandard: "تلاوة عادية",
     tabPrayer: "تلاوة صلاة",
-    trimHint:
-      "حدد أوقات البداية والنهاية (مثال: 01:20) لاستبعاد الركوع والسجود أو استخراج مقطع محدد",
+    rangeActionRemove: "حذف هذه المقاطع",
+    rangeActionKeep: "الاحتفاظ بهذه المقاطع فقط",
+    trimHintRemove:
+      "أدخل أوقات المقاطع التي تريد حذفها (مثل الفاتحة والركوع والسجود) وسيتم الاحتفاظ بباقي التلاوة",
+    trimHintKeep:
+      "أدخل أوقات المقاطع التي تريد الاحتفاظ بها فقط وسيتم دمجها معاً",
     startTime: "البداية",
     endTime: "النهاية",
     rangeNumber: (n) => `الجزء ${n}`,
@@ -58,6 +62,8 @@ export const TRANSLATIONS = {
     resultTitle: "تمت تنقية التلاوة",
     resultSummary: (orig, final, saved) =>
       `قَلّت المدة من ${orig} إلى ${final} (تم توفير ${saved})`,
+    resultSilenceSkippedNotice:
+      "تم تجهيز ودمج المقاطع التي حدّدتها بنجاح. ونظراً لارتفاع الضوضاء الخلفية، تم تخطي حذف السكتات التلقائي حفاظاً على كل حرف من التلاوة.",
     downloadBtn: "تحميل التلاوة",
     shareBtn: "مشاركة الأداة",
     shareTitle: "أَنصِتُوا",
@@ -88,6 +94,7 @@ export const TRANSLATIONS = {
       blankRangeRow: "يرجى إدخال وقت البداية أو النهاية لكل جزء مضاف، أو حذفه.",
       invalidTimestamp: "صيغة الوقت غير صحيحة. استخدم MM:SS أو HH:MM:SS.",
       rangeExceedsDuration: "أحد أوقات البداية يتجاوز مدة الملف الصوتي.",
+      allAudioRemoved: "المقاطع المحددة للحذف تغطي كامل مدة الملف الصوتي، لم يتبقَّ أي جزء للاحتفاظ به.",
       noSpeechDetected: "لم يتم العثور على مقاطع صوتية واضحة في هذا الملف.",
       ffmpegFailed: "تعذّر فك ترميز أو تصدير الملف الصوتي. تأكد من سلامة الملف.",
     },
@@ -126,8 +133,12 @@ export const TRANSLATIONS = {
     losslessHint: "Exports as uncompressed Lossless WAV preserving original PCM quality.",
     tabStandard: "Standard Recitation",
     tabPrayer: "Prayer Recitation",
-    trimHint:
-      "Set start and end times (e.g. 01:20) to exclude ruku' and sujud or extract selected passages",
+    rangeActionRemove: "Remove these ranges",
+    rangeActionKeep: "Keep only these ranges",
+    trimHintRemove:
+      "Enter timestamps to remove (e.g., Al-Fatihah, Ruku', Sujud) and keep the rest of the recitation",
+    trimHintKeep:
+      "Enter timestamps to keep only those passages and join them together",
     startTime: "Start",
     endTime: "End",
     rangeNumber: (n) => `Section ${n}`,
@@ -146,6 +157,8 @@ export const TRANSLATIONS = {
     resultTitle: "Recitation cleaned",
     resultSummary: (orig, final, saved) =>
       `Duration reduced from ${orig} to ${final} (${saved} saved)`,
+    resultSilenceSkippedNotice:
+      "Your requested segments were prepared and joined. Because of high background noise, automatic silence removal was skipped to protect every letter of the recitation.",
     downloadBtn: "Download audio",
     shareBtn: "Share tool",
     shareTitle: "ansitu",
@@ -176,6 +189,7 @@ export const TRANSLATIONS = {
       blankRangeRow: "Please enter a start or end timestamp for each section, or remove it.",
       invalidTimestamp: "Invalid timestamp format. Use MM:SS or HH:MM:SS.",
       rangeExceedsDuration: "A section start timestamp exceeds the audio duration.",
+      allAudioRemoved: "The ranges selected for removal cover the entire audio file, leaving nothing to keep.",
       noSpeechDetected: "No clear speech segments were detected in this audio.",
       ffmpegFailed: "Could not decode or export this audio file. Please verify the file.",
     },

@@ -893,3 +893,150 @@ export function encodeWavInt16(pcm, sampleRate, channels = 1) {
   dst.set(pcm);
   return buffer;
 }
+
+/**
+ * Resolve user-supplied Prayer Mode ranges against `totalDuration`.
+ *
+ * - `rangeAction === "keep"` (default): validates and clamps each requested range in order.
+ * - `rangeAction === "remove"`: merges overlapping/adjacent exclusion ranges, clamps to
+ *   `[0, totalDuration]`, and returns the complement intervals to keep. Throws
+ *   `ALL_AUDIO_REMOVED` if nothing remains.
+ */
+export function resolveEffectiveRanges(ranges, totalDuration, rangeAction = "keep") {
+  const dur = Number(totalDuration);
+  if (!Number.isFinite(dur) || dur <= 0) {
+    throw new Error("INVALID_DURATION");
+  }
+  if (!Array.isArray(ranges) || ranges.length === 0) {
+    return [{ startS: 0.0, endS: dur }];
+  }
+
+  const normalized = [];
+  for (const r of ranges) {
+    const rawStart =
+      r.startS !== null && r.startS !== undefined ? Number(r.startS) : 0.0;
+    const rawEnd =
+      r.endS !== null && r.endS !== undefined ? Number(r.endS) : dur;
+    const clipStart = Math.max(0.0, rawStart);
+    const clipEnd = Math.min(rawEnd, dur);
+
+    if (clipStart >= dur) {
+      throw new Error("RANGE_EXCEEDS_DURATION");
+    }
+    if (clipStart >= clipEnd) {
+      throw new Error("INVALID_RANGE_ORDER");
+    }
+    normalized.push({ startS: clipStart, endS: clipEnd });
+  }
+
+  if (rangeAction !== "remove") {
+    return normalized;
+  }
+
+  // Merge overlapping or adjacent exclusion ranges
+  const sorted = normalized
+    .slice()
+    .sort((a, b) => a.startS - b.startS || a.endS - b.endS);
+  const merged = [];
+  for (const seg of sorted) {
+    if (merged.length === 0 || seg.startS > merged[merged.length - 1].endS + 1e-6) {
+      merged.push({ startS: seg.startS, endS: seg.endS });
+    } else {
+      merged[merged.length - 1].endS = Math.max(
+        merged[merged.length - 1].endS,
+        seg.endS
+      );
+    }
+  }
+
+  // Compute complement intervals against [0, dur]
+  const kept = [];
+  let cursor = 0.0;
+  for (const ex of merged) {
+    if (ex.startS - cursor > 1e-3) {
+      kept.push({ startS: cursor, endS: ex.startS });
+    }
+    cursor = Math.max(cursor, ex.endS);
+  }
+  if (dur - cursor > 1e-3) {
+    kept.push({ startS: cursor, endS: dur });
+  }
+
+  if (kept.length === 0) {
+    throw new Error("ALL_AUDIO_REMOVED");
+  }
+  return kept;
+}
+
+/**
+ * Decide how to proceed after VAD analysis across `effectiveRanges`.
+ *
+ * - Normal Mode (or Prayer Mode with no user ranges): preserves exact safety-guard
+ *   abort on `low_snr_guarded` and throws `NO_SPEECH_DETECTED` if any range is empty.
+ * - Prayer Mode with user ranges: NEVER discards the user's montage. If any range
+ *   triggered `low_snr_guarded` or yielded 0 speech segments, keeps that range intact
+ *   without automatic silence removal and flags `silenceTrimSkipped: true`.
+ */
+export function applyPrayerModeFallback(
+  rangeResults,
+  effectiveRanges,
+  { isPrayerMode = false, hasUserRanges = false } = {}
+) {
+  const preserveMontage = Boolean(isPrayerMode && hasUserRanges);
+
+  if (!preserveMontage) {
+    const allGuarded = rangeResults.every((r) => Boolean(r.low_snr_guarded));
+    if (allGuarded) {
+      return {
+        action: "abort_low_snr",
+        rangeResults,
+        silenceTrimSkipped: false,
+      };
+    }
+    if (rangeResults.some((r) => !r.segments || r.segments.length === 0)) {
+      throw new Error("NO_SPEECH_DETECTED");
+    }
+    return {
+      action: "splice",
+      rangeResults,
+      silenceTrimSkipped: false,
+    };
+  }
+
+  let silenceTrimSkipped = false;
+  const fallbackCrossfadeMs = effectiveRanges.length > 1 ? 80 : 0;
+
+  const adjusted = rangeResults.map((res, idx) => {
+    const eff = effectiveRanges[idx];
+    const isGuarded = Boolean(res.low_snr_guarded);
+    const isEmpty = !res.segments || res.segments.length === 0;
+    if (!isGuarded && !isEmpty) {
+      return res;
+    }
+    silenceTrimSkipped = true;
+    const dur = Math.max(0.0, eff.endS - eff.startS);
+    return {
+      ...res,
+      segments: [
+        {
+          start: eff.startS,
+          end: eff.endS,
+          duration: dur,
+        },
+      ],
+      resolved_crossfade_ms: Math.max(
+        res.resolved_crossfade_ms ?? 0,
+        fallbackCrossfadeMs
+      ),
+      resolved_gap_ms: 0,
+      use_room_tone: false,
+      direct_overlap: false,
+    };
+  });
+
+  return {
+    action: "splice",
+    rangeResults: adjusted,
+    silenceTrimSkipped,
+  };
+}

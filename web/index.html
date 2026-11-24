@@ -162,8 +162,28 @@
         </div>
 
         <div id="trim-panel" class="trim-panel" role="tabpanel" aria-labelledby="tab-prayer" hidden>
+          <div class="range-action-toggle" role="radiogroup" aria-label="طريقة معالجة المقاطع">
+            <button
+              id="range-action-remove"
+              type="button"
+              role="radio"
+              class="range-action-btn is-active"
+              aria-checked="true"
+            >
+              حذف هذه المقاطع
+            </button>
+            <button
+              id="range-action-keep"
+              type="button"
+              role="radio"
+              class="range-action-btn"
+              aria-checked="false"
+            >
+              الاحتفاظ بهذه المقاطع فقط
+            </button>
+          </div>
           <p id="trim-hint" class="trim-hint">
-            حدد أوقات البداية والنهاية (مثال: 01:20) لاستبعاد الركوع والسجود أو استخراج مقطع محدد
+            أدخل أوقات المقاطع التي تريد حذفها (مثل الفاتحة والركوع والسجود) وسيتم الاحتفاظ بباقي التلاوة
           </p>
           <div id="ranges-list" class="ranges-list"></div>
           <button id="add-range-btn" type="button" class="secondary-sm-btn">
@@ -229,6 +249,7 @@
 
         <h2 id="result-title" class="panel-heading">تمت تنقية التلاوة</h2>
         <p id="result-summary" class="result-summary"></p>
+        <p id="result-notice" class="result-notice" role="status" hidden></p>
 
         <div class="result-actions">
           <a id="download-btn" class="primary-btn download-link" download>
