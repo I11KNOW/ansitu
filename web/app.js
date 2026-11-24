@@ -627,7 +627,14 @@ async function handleShareClick() {
 
 function setupPwaInstall() {
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js").catch(() => {});
+    const registerSw = () => {
+      navigator.serviceWorker.register("./sw.js").catch(() => {});
+    };
+    if (document.readyState === "complete") {
+      registerSw();
+    } else {
+      window.addEventListener("load", registerSw, { once: true });
+    }
   }
 
   if (isStandaloneMode()) {

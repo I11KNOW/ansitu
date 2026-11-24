@@ -4,7 +4,7 @@
  * fetched from jsDelivr for offline reuse.
  */
 
-const CACHE_NAME = "ansitu-shell-v1";
+const CACHE_NAME = "ansitu-shell-v2";
 const FFMPEG_CACHE = "ansitu-ffmpeg-v1";
 
 const SHELL_ASSETS = [
@@ -22,7 +22,6 @@ const SHELL_ASSETS = [
   "./icons/icon-192.png",
   "./icons/icon-512.png",
   "./icons/apple-touch-icon.png",
-  "./assets/og-preview.png",
 ];
 
 self.addEventListener("install", (event) => {

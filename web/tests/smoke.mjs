@@ -157,6 +157,15 @@ function checkI18nAndHtmlRules() {
   assert.ok(workerSrc.includes("isLosslessSource"), "worker.js must preserve bit-exact lossless WAV");
   assert.ok(workerSrc.includes("deleteFile("), "worker.js must explicitly unlink MEMFS temp files");
   assert.ok(!workerSrc.includes("-compression_level"), "worker.js must NOT set -compression_level");
+
+  const swSrc = fs.readFileSync(path.join(WEB_ROOT, "sw.js"), "utf-8");
+  const shellMatch = swSrc.match(/const SHELL_ASSETS = \[([\s\S]*?)\];/);
+  assert.ok(shellMatch, "sw.js must define SHELL_ASSETS");
+  const shellBlock = shellMatch[1];
+  assert.ok(!/\.wasm\b/i.test(shellBlock), "sw.js SHELL_ASSETS must not pre-cache WASM binaries");
+  assert.ok(!/\.onnx\b/i.test(shellBlock), "sw.js SHELL_ASSETS must not pre-cache ONNX models");
+  assert.ok(!shellBlock.includes("og-preview.png"), "sw.js SHELL_ASSETS must not pre-cache og-preview.png");
+  assert.ok(!/fonts\.googleapis\.com/i.test(html), "index.html should not block paint with external font stylesheets");
 }
 
 async function checkDevServer() {
