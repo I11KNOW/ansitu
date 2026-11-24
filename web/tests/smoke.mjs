@@ -11,7 +11,10 @@ import { WEB3FORMS_ACCESS_KEY } from "../config.js";
 import { createStaticServer } from "../dev-server.mjs";
 import {
   applyPrayerModeFallback,
+  formatTimestampDigits,
+  formatTimestampOnBlur,
   resolveEffectiveRanges,
+  spliceRangesInt16,
 } from "../engine/splicer.js";
 import {
   TRANSLATIONS,
@@ -105,8 +108,24 @@ function checkI18nAndHtmlRules() {
 
   assert.equal(parseTimestamp("05:00"), 300);
   assert.equal(parseTimestamp("01:02:03"), 3723);
+  assert.equal(parseTimestamp("00.45"), 45);
+  assert.equal(parseTimestamp("00,45"), 45);
+  assert.equal(parseTimestamp("00-45"), 45);
+  assert.equal(parseTimestamp("00 45"), 45);
+  assert.equal(parseTimestamp("0045"), 45);
+  assert.equal(parseTimestamp("130"), 90);
+  assert.equal(parseTimestamp("10530"), 3930);
+  assert.equal(parseTimestamp("٠٠.٤٥"), 45);
+  assert.equal(formatTimestampDigits("0045"), "00:45");
+  assert.equal(formatTimestampDigits("130"), "1:30");
+  assert.equal(formatTimestampDigits("10530"), "1:05:30");
+  assert.equal(formatTimestampOnBlur("00.45"), "00:45");
+  assert.equal(formatTimestampOnBlur("0045"), "00:45");
+  assert.equal(formatTimestampOnBlur("130"), "01:30");
+  assert.equal(formatTimestampOnBlur("10530"), "1:05:30");
   assert.throws(() => parseTimestamp("bad:time"));
   assert.throws(() => parseTimestamp("01:75"));
+  assert.throws(() => parseTimestamp("175"));
 
   assert.equal(buildOutputFilename("bahtimi_taha.mp3", "m4a"), "bahtimi_taha_ansitu.m4a");
   assert.equal(buildOutputFilename("surah.flac", "wav", "lossless_wav"), "surah_ansitu_lossless.wav");
@@ -153,6 +172,8 @@ function checkI18nAndHtmlRules() {
   assert.equal(en.rangeActionKeep, "Keep only these ranges");
   assert.ok(ar.resultSilenceSkippedNotice.length > 20);
   assert.ok(en.resultSilenceSkippedNotice.length > 20);
+  assert.ok(ar.resultSilencePartialNotice.length > 20);
+  assert.ok(en.resultSilencePartialNotice.length > 20);
   assert.ok(ar.errors.allAudioRemoved.length > 10);
   assert.ok(en.errors.allAudioRemoved.length > 10);
   assert.ok(html.includes("تنقية التلاوة"));
@@ -282,6 +303,7 @@ function checkPrayerModeLogic() {
   });
   assert.equal(prayerDecision.action, "splice");
   assert.equal(prayerDecision.silenceTrimSkipped, true);
+  assert.equal(prayerDecision.silenceTrimStatus, "skipped");
   assert.equal(prayerDecision.rangeResults.length, 2);
   assert.deepEqual(prayerDecision.rangeResults[0].segments, [
     { start: 0, end: 60, duration: 60 },
@@ -291,7 +313,101 @@ function checkPrayerModeLogic() {
   ]);
   assert.equal(prayerDecision.rangeResults[0].resolved_crossfade_ms, 80);
 
-  // 8. Prayer Mode with clean speech segments does NOT show skipped notice
+  // 8. Prayer Mode partial skip (1 noisy range + 1 clean trimmed range) must NOT set silenceTrimSkipped=true
+  const partialDecision = applyPrayerModeFallback(
+    [
+      {
+        segments: [{ start: 0, end: 60, duration: 60 }],
+        total_duration: 60,
+        low_snr_guarded: true,
+        resolved_crossfade_ms: 0,
+        resolved_gap_ms: 0,
+      },
+      {
+        segments: [{ start: 120, end: 250, duration: 130 }],
+        total_duration: 180,
+        low_snr_guarded: false,
+        resolved_crossfade_ms: 100,
+        resolved_gap_ms: 100,
+      },
+    ],
+    prayerRanges,
+    { isPrayerMode: true, hasUserRanges: true }
+  );
+  assert.equal(partialDecision.action, "splice");
+  assert.equal(partialDecision.silenceTrimSkipped, false);
+  assert.equal(partialDecision.silenceTrimStatus, "partial");
+  assert.equal(partialDecision.skippedRangesCount, 1);
+
+  // 9. Tiny (<1.2s) edge sliver hitting low_snr_guarded while main recitation is clean must NOT show noise notice
+  const sliverDecision = applyPrayerModeFallback(
+    [
+      {
+        segments: [{ start: 0, end: 0.4, duration: 0.4 }],
+        total_duration: 0.4,
+        low_snr_guarded: true,
+        resolved_crossfade_ms: 0,
+        resolved_gap_ms: 0,
+      },
+      {
+        segments: [{ start: 45, end: 2100, duration: 2055 }],
+        total_duration: 2219,
+        low_snr_guarded: false,
+        resolved_crossfade_ms: 100,
+        resolved_gap_ms: 100,
+      },
+    ],
+    [
+      { startS: 0, endS: 0.4 },
+      { startS: 45, endS: 2264 },
+    ],
+    { isPrayerMode: true, hasUserRanges: true }
+  );
+  assert.equal(sliverDecision.action, "splice");
+  assert.equal(sliverDecision.silenceTrimSkipped, false);
+  assert.equal(sliverDecision.silenceTrimStatus, "trimmed");
+
+  // 10. End-to-end saved-duration accuracy when silenceTrimSkipped === true
+  const sr = 8000;
+  const origDurS = 10;
+  const pcm = new Int16Array(sr * origDurS);
+  const effAfterRemove = resolveEffectiveRanges(
+    [{ startS: 0, endS: 2 }],
+    origDurS,
+    "remove"
+  );
+  const fullSkipDecision = applyPrayerModeFallback(
+    [
+      {
+        segments: [{ start: 2, end: 10, duration: 8 }],
+        total_duration: 8,
+        low_snr_guarded: true,
+        resolved_crossfade_ms: 0,
+        resolved_gap_ms: 0,
+      },
+    ],
+    effAfterRemove,
+    { isPrayerMode: true, hasUserRanges: true }
+  );
+  assert.equal(fullSkipDecision.silenceTrimSkipped, true);
+  assert.equal(fullSkipDecision.silenceTrimStatus, "skipped");
+  const spliced = spliceRangesInt16({
+    pcm,
+    sampleRate: sr,
+    channels: 1,
+    rangeResults: fullSkipDecision.rangeResults,
+  });
+  const savedDuration = origDurS - spliced.duration;
+  assert.ok(
+    Math.abs(spliced.duration - 8.0) < 0.01,
+    `Expected 8.0s exported duration, got ${spliced.duration}`
+  );
+  assert.ok(
+    Math.abs(savedDuration - 2.0) < 0.01,
+    `Expected 2.0s saved duration (matching only removed range), got ${savedDuration}`
+  );
+
+  // 11. Prayer Mode with clean speech segments does NOT show skipped notice
   const cleanPrayerVad = [
     {
       segments: [{ start: 1, end: 59, duration: 58 }],
@@ -308,6 +424,7 @@ function checkPrayerModeLogic() {
   );
   assert.equal(cleanDecision.action, "splice");
   assert.equal(cleanDecision.silenceTrimSkipped, false);
+  assert.equal(cleanDecision.silenceTrimStatus, "trimmed");
 }
 
 async function checkDevServer() {

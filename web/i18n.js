@@ -3,6 +3,9 @@
  * for ansitu web app.
  */
 
+import { parseTimestamp } from "./engine/splicer.js";
+export { parseTimestamp };
+
 export const TRANSLATIONS = {
   ar: {
     lang: "ar",
@@ -64,6 +67,8 @@ export const TRANSLATIONS = {
       `قَلّت المدة من ${orig} إلى ${final} (تم توفير ${saved})`,
     resultSilenceSkippedNotice:
       "تم تجهيز ودمج المقاطع التي حدّدتها بنجاح. ونظراً لارتفاع الضوضاء الخلفية، تم تخطي حذف السكتات التلقائي حفاظاً على كل حرف من التلاوة.",
+    resultSilencePartialNotice:
+      "تم تجهيز المقاطع التي حدّدتها وحذف السكتات الطويلة من المقاطع الصافية، بينما تم الإبقاء على بعض المقاطع ذات الضوضاء المرتفعة دون قصّ تلقائي حفاظاً على التلاوة.",
     downloadBtn: "تحميل التلاوة",
     shareBtn: "مشاركة الأداة",
     shareTitle: "أَنصِتُوا",
@@ -159,6 +164,8 @@ export const TRANSLATIONS = {
       `Duration reduced from ${orig} to ${final} (${saved} saved)`,
     resultSilenceSkippedNotice:
       "Your requested segments were prepared and joined. Because of high background noise, automatic silence removal was skipped to protect every letter of the recitation.",
+    resultSilencePartialNotice:
+      "Your requested segments were prepared: long pauses were trimmed from clean sections, while noisy sections were kept intact without automatic trimming to protect the recitation.",
     downloadBtn: "Download audio",
     shareBtn: "Share tool",
     shareTitle: "ansitu",
@@ -210,57 +217,6 @@ export function formatClock(seconds) {
     return `${pad(hours)}:${pad(minutes)}:${pad(secs)}`;
   }
   return `${pad(minutes)}:${pad(secs)}`;
-}
-
-/**
- * Parse `MM:SS`, `HH:MM:SS`, or numeric seconds into non-negative float seconds
- * matching `quran_cleaner/media.py`'s `parse_timestamp`.
- */
-export function parseTimestamp(value) {
-  const raw = String(value ?? "").trim();
-  if (!raw) {
-    throw new Error("INVALID_TIMESTAMP");
-  }
-
-  if (!raw.includes(":")) {
-    const secs = Number(raw);
-    if (!Number.isFinite(secs) || secs < 0) {
-      throw new Error("INVALID_TIMESTAMP");
-    }
-    return secs;
-  }
-
-  const parts = raw.split(":");
-  if (parts.length !== 2 && parts.length !== 3) {
-    throw new Error("INVALID_TIMESTAMP");
-  }
-
-  const nums = parts.map((p) => (p.trim() === "" ? NaN : Number(p)));
-  if (nums.some((n) => !Number.isFinite(n))) {
-    throw new Error("INVALID_TIMESTAMP");
-  }
-
-  if (nums.length === 2) {
-    const [mins, secs] = nums;
-    if (mins < 0 || secs < 0 || secs >= 60.0 || !Number.isInteger(mins)) {
-      throw new Error("INVALID_TIMESTAMP");
-    }
-    return mins * 60.0 + secs;
-  }
-
-  const [hours, mins, secs] = nums;
-  if (
-    hours < 0 ||
-    mins < 0 ||
-    secs < 0 ||
-    mins >= 60.0 ||
-    secs >= 60.0 ||
-    !Number.isInteger(hours) ||
-    !Number.isInteger(mins)
-  ) {
-    throw new Error("INVALID_TIMESTAMP");
-  }
-  return hours * 3600.0 + mins * 60.0 + secs;
 }
 
 /**

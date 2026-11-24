@@ -445,6 +445,7 @@ self.onmessage = async (event) => {
     }
 
     const silenceTrimSkipped = decision.silenceTrimSkipped;
+    const silenceTrimStatus = decision.silenceTrimStatus;
 
     postProgress("splicing", 66);
     let spliced = spliceRangesInt16({
@@ -476,6 +477,7 @@ self.onmessage = async (event) => {
           originalDuration,
           finalDuration,
           silenceTrimSkipped,
+          silenceTrimStatus,
           coreMode: loadedMode,
         },
         [wavOutBuf]
@@ -539,6 +541,7 @@ self.onmessage = async (event) => {
         originalDuration,
         finalDuration,
         silenceTrimSkipped,
+        silenceTrimStatus,
         coreMode: loadedMode,
       },
       [exactBuf]

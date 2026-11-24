@@ -894,6 +894,134 @@ export function encodeWavInt16(pcm, sampleRate, channels = 1) {
   return buffer;
 }
 
+const ARABIC_DIGIT_MAP = {
+  "٠": "0",
+  "١": "1",
+  "٢": "2",
+  "٣": "3",
+  "٤": "4",
+  "٥": "5",
+  "٦": "6",
+  "٧": "7",
+  "٨": "8",
+  "٩": "9",
+  "۰": "0",
+  "۱": "1",
+  "۲": "2",
+  "۳": "3",
+  "۴": "4",
+  "۵": "5",
+  "۶": "6",
+  "۷": "7",
+  "۸": "8",
+  "۹": "9",
+};
+
+/**
+ * Convert Arabic-Indic / Eastern Arabic digits to ASCII and normalize
+ * `.`, `,`, `-`, spaces, and fullwidth colons to `:`.
+ */
+export function normalizeTimestampSeparators(value) {
+  return String(value ?? "")
+    .replace(/[٠-٩۰-۹]/g, (ch) => ARABIC_DIGIT_MAP[ch] || ch)
+    .replace(/[\s.,،٫\-：]+/g, ":")
+    .replace(/:+/g, ":");
+}
+
+/**
+ * Format 1-6 pure digits as a clock string (`0045` -> `00:45`, `130` -> `1:30`, `10530` -> `1:05:30`).
+ */
+export function formatTimestampDigits(digits) {
+  const d = String(digits ?? "").replace(/\D/g, "");
+  if (d.length <= 2) {
+    return d;
+  }
+  if (d.length === 3) {
+    return `${d.slice(0, 1)}:${d.slice(1)}`;
+  }
+  if (d.length === 4) {
+    return `${d.slice(0, 2)}:${d.slice(2)}`;
+  }
+  if (d.length === 5) {
+    return `${d.slice(0, 1)}:${d.slice(1, 3)}:${d.slice(3)}`;
+  }
+  return `${d.slice(0, 2)}:${d.slice(2, 4)}:${d.slice(4, 6)}`;
+}
+
+/**
+ * Parse flexible Prayer Mode timestamps into non-negative seconds:
+ * - Treats `.`, `,`, `-`, and spaces as `:` (`00.45` -> `00:45` -> 45s, NEVER 0.45s).
+ * - Supports pure digits (`0045` -> 45s, `130` -> 90s, `10530` -> 3930s).
+ * - Supports `MM:SS` and `HH:MM:SS`.
+ */
+export function parseTimestamp(value) {
+  const raw = normalizeTimestampSeparators(value).trim();
+  if (!raw) {
+    throw new Error("INVALID_TIMESTAMP");
+  }
+
+  if (!raw.includes(":")) {
+    if (!/^\d+$/.test(raw) || raw.length > 6) {
+      throw new Error("INVALID_TIMESTAMP");
+    }
+    if (raw.length <= 2) {
+      return Number(raw);
+    }
+    const formatted = formatTimestampDigits(raw);
+    return parseTimestamp(formatted);
+  }
+
+  const parts = raw.split(":");
+  if (parts.length !== 2 && parts.length !== 3) {
+    throw new Error("INVALID_TIMESTAMP");
+  }
+  if (parts.some((p) => !/^\d+$/.test(p))) {
+    throw new Error("INVALID_TIMESTAMP");
+  }
+
+  const nums = parts.map((p) => Number(p));
+  if (nums.length === 2) {
+    const [mins, secs] = nums;
+    if (mins < 0 || secs < 0 || secs >= 60) {
+      throw new Error("INVALID_TIMESTAMP");
+    }
+    return mins * 60 + secs;
+  }
+
+  const [hours, mins, secs] = nums;
+  if (hours < 0 || mins < 0 || secs < 0 || mins >= 60 || secs >= 60) {
+    throw new Error("INVALID_TIMESTAMP");
+  }
+  return hours * 3600 + mins * 60 + secs;
+}
+
+/**
+ * Canonicalize a timestamp input on blur without altering invalid user text:
+ * `00.45` -> `00:45`, `0045` -> `00:45`, `130` -> `01:30`, `10530` -> `1:05:30`.
+ */
+export function formatTimestampOnBlur(value) {
+  const normalized = normalizeTimestampSeparators(value).trim();
+  if (!normalized) {
+    return "";
+  }
+  let secs;
+  try {
+    secs = parseTimestamp(normalized);
+  } catch {
+    return normalized;
+  }
+  const pad = (n) => String(n).padStart(2, "0");
+  const hours = Math.floor(secs / 3600);
+  const rem = secs % 3600;
+  const mins = Math.floor(rem / 60);
+  const s = rem % 60;
+  if (hours > 0) {
+    const hStr = hours >= 10 || normalized.startsWith("0") ? pad(hours) : String(hours);
+    return `${hStr}:${pad(mins)}:${pad(s)}`;
+  }
+  return `${pad(mins)}:${pad(s)}`;
+}
+
 /**
  * Resolve user-supplied Prayer Mode ranges against `totalDuration`.
  *
@@ -973,9 +1101,13 @@ export function resolveEffectiveRanges(ranges, totalDuration, rangeAction = "kee
  *
  * - Normal Mode (or Prayer Mode with no user ranges): preserves exact safety-guard
  *   abort on `low_snr_guarded` and throws `NO_SPEECH_DETECTED` if any range is empty.
- * - Prayer Mode with user ranges: NEVER discards the user's montage. If any range
- *   triggered `low_snr_guarded` or yielded 0 speech segments, keeps that range intact
- *   without automatic silence removal and flags `silenceTrimSkipped: true`.
+ * - Prayer Mode with user ranges: NEVER discards the user's montage.
+ *   - `silenceTrimStatus === "skipped"` (`silenceTrimSkipped === true`): ONLY when ALL
+ *     ranges skipped automatic silence trimming (so ONLY user ranges are kept/removed).
+ *   - `silenceTrimStatus === "partial"` (`silenceTrimSkipped === false`): some clean
+ *     ranges had pauses trimmed while noisy/quiet ranges (>= 1.2s) were kept intact.
+ *   - `silenceTrimStatus === "trimmed"` (`silenceTrimSkipped === false`): all ranges
+ *     analyzed cleanly.
  */
 export function applyPrayerModeFallback(
   rangeResults,
@@ -991,6 +1123,9 @@ export function applyPrayerModeFallback(
         action: "abort_low_snr",
         rangeResults,
         silenceTrimSkipped: false,
+        silenceTrimStatus: "skipped",
+        skippedRangesCount: rangeResults.length,
+        totalRangesCount: rangeResults.length,
       };
     }
     if (rangeResults.some((r) => !r.segments || r.segments.length === 0)) {
@@ -1000,21 +1135,33 @@ export function applyPrayerModeFallback(
       action: "splice",
       rangeResults,
       silenceTrimSkipped: false,
+      silenceTrimStatus: "trimmed",
+      skippedRangesCount: 0,
+      totalRangesCount: rangeResults.length,
     };
   }
 
-  let silenceTrimSkipped = false;
+  // Sub-1.2s residual edge slivers cannot have >= 1.2s silences cut by VAD anyway;
+  // keep them intact without misreporting a noisy-section notice when other ranges are clean.
+  const MIN_TRIMMABLE_RANGE_S = 1.2;
+  let skippedAnyCount = 0;
+  let skippedSignificantCount = 0;
+  let cleanCount = 0;
   const fallbackCrossfadeMs = effectiveRanges.length > 1 ? 80 : 0;
 
   const adjusted = rangeResults.map((res, idx) => {
     const eff = effectiveRanges[idx];
+    const dur = Math.max(0.0, eff.endS - eff.startS);
     const isGuarded = Boolean(res.low_snr_guarded);
     const isEmpty = !res.segments || res.segments.length === 0;
     if (!isGuarded && !isEmpty) {
+      cleanCount += 1;
       return res;
     }
-    silenceTrimSkipped = true;
-    const dur = Math.max(0.0, eff.endS - eff.startS);
+    skippedAnyCount += 1;
+    if (effectiveRanges.length === 1 || dur >= MIN_TRIMMABLE_RANGE_S) {
+      skippedSignificantCount += 1;
+    }
     return {
       ...res,
       segments: [
@@ -1034,9 +1181,20 @@ export function applyPrayerModeFallback(
     };
   });
 
+  const allSkipped = skippedAnyCount === rangeResults.length;
+  let silenceTrimStatus = "trimmed";
+  if (allSkipped) {
+    silenceTrimStatus = "skipped";
+  } else if (skippedSignificantCount > 0 && cleanCount > 0) {
+    silenceTrimStatus = "partial";
+  }
+
   return {
     action: "splice",
     rangeResults: adjusted,
-    silenceTrimSkipped,
+    silenceTrimSkipped: allSkipped,
+    silenceTrimStatus,
+    skippedRangesCount: skippedSignificantCount,
+    totalRangesCount: rangeResults.length,
   };
 }

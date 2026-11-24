@@ -12,6 +12,9 @@ import {
 } from "./config.js";
 import {
   DEFAULT_QUALITY_PRESET,
+  formatTimestampDigits,
+  formatTimestampOnBlur,
+  normalizeTimestampSeparators,
   qualityOptionsForSource,
 } from "./engine/splicer.js";
 import {
@@ -260,6 +263,61 @@ function syncLosslessState() {
   els.losslessHint.hidden = !isLossless;
 }
 
+function bindTimestampInput(input, getVal, setVal) {
+  input.type = "text";
+  input.inputMode = "numeric";
+  input.setAttribute("inputmode", "numeric");
+  input.autocomplete = "off";
+  input.spellcheck = false;
+
+  let manualSep = getVal().includes(":");
+
+  input.addEventListener("input", (e) => {
+    const prev = getVal();
+    const raw = e.target.value;
+    const isDeleting =
+      (e.inputType && e.inputType.startsWith("delete")) ||
+      raw.length < prev.length;
+
+    if (/[:.,،٫\-：\s]/.test(raw) && !prev.includes(":")) {
+      manualSep = true;
+    }
+
+    let next = normalizeTimestampSeparators(raw).replace(/[^0-9:]/g, "");
+    if (!next) {
+      manualSep = false;
+    } else if (
+      !isDeleting &&
+      !manualSep &&
+      e.target.selectionStart === raw.length
+    ) {
+      const digitsOnly = next.replace(/:/g, "");
+      if (digitsOnly.length >= 3 && digitsOnly.length <= 6) {
+        next = formatTimestampDigits(digitsOnly);
+      }
+    }
+
+    if (next !== raw) {
+      const caret = e.target.selectionStart;
+      e.target.value = next;
+      if (typeof caret === "number") {
+        const delta = next.length - raw.length;
+        const pos = Math.max(0, Math.min(next.length, caret + delta));
+        e.target.setSelectionRange(pos, pos);
+      }
+    }
+    setVal(next);
+    showInputError("");
+  });
+
+  input.addEventListener("blur", (e) => {
+    const formatted = formatTimestampOnBlur(e.target.value);
+    e.target.value = formatted;
+    setVal(formatted);
+    manualSep = formatted.includes(":");
+  });
+}
+
 function renderRanges() {
   const tr = t();
   els.rangesList.innerHTML = "";
@@ -272,14 +330,15 @@ function renderRanges() {
     const startLbl = document.createElement("label");
     startLbl.textContent = `${tr.startTime} (${tr.rangeNumber(idx + 1)})`;
     const startInp = document.createElement("input");
-    startInp.type = "text";
-    startInp.inputMode = "numeric";
     startInp.placeholder = "00:00";
     startInp.value = row.start;
-    startInp.addEventListener("input", (e) => {
-      row.start = e.target.value;
-      showInputError("");
-    });
+    bindTimestampInput(
+      startInp,
+      () => row.start,
+      (v) => {
+        row.start = v;
+      }
+    );
     startField.append(startLbl, startInp);
 
     const endField = document.createElement("div");
@@ -287,14 +346,15 @@ function renderRanges() {
     const endLbl = document.createElement("label");
     endLbl.textContent = `${tr.endTime} (${tr.rangeNumber(idx + 1)})`;
     const endInp = document.createElement("input");
-    endInp.type = "text";
-    endInp.inputMode = "numeric";
     endInp.placeholder = "05:00";
     endInp.value = row.end;
-    endInp.addEventListener("input", (e) => {
-      row.end = e.target.value;
-      showInputError("");
-    });
+    bindTimestampInput(
+      endInp,
+      () => row.end,
+      (v) => {
+        row.end = v;
+      }
+    );
     endField.append(endLbl, endInp);
 
     const rmBtn = document.createElement("button");
@@ -317,15 +377,23 @@ function renderResultSummary() {
     els.resultNotice.hidden = true;
     return;
   }
-  const orig = formatClock(state.lastResult.originalDuration);
-  const fin = formatClock(state.lastResult.finalDuration);
-  const saved = formatClock(
-    Math.max(0, state.lastResult.originalDuration - state.lastResult.finalDuration)
-  );
+  const origS = Math.max(0, Math.round(Number(state.lastResult.originalDuration) || 0));
+  const finS = Math.max(0, Math.round(Number(state.lastResult.finalDuration) || 0));
+  const savedS = Math.max(0, origS - finS);
   const tr = t();
-  els.resultSummary.textContent = tr.resultSummary(orig, fin, saved);
-  if (state.lastResult.silenceTrimSkipped) {
+  els.resultSummary.textContent = tr.resultSummary(
+    formatClock(origS),
+    formatClock(finS),
+    formatClock(savedS)
+  );
+  const status =
+    state.lastResult.silenceTrimStatus ||
+    (state.lastResult.silenceTrimSkipped ? "skipped" : "trimmed");
+  if (status === "skipped") {
     els.resultNotice.textContent = tr.resultSilenceSkippedNotice;
+    els.resultNotice.hidden = false;
+  } else if (status === "partial") {
+    els.resultNotice.textContent = tr.resultSilencePartialNotice;
     els.resultNotice.hidden = false;
   } else {
     els.resultNotice.hidden = true;
@@ -581,6 +649,8 @@ async function startProcessing(file) {
         finalDuration: msg.finalDuration,
         ext: msg.ext,
         silenceTrimSkipped: Boolean(msg.silenceTrimSkipped),
+        silenceTrimStatus:
+          msg.silenceTrimStatus || (msg.silenceTrimSkipped ? "skipped" : "trimmed"),
       };
       els.downloadBtn.href = state.downloadUrl;
       els.downloadBtn.download = buildOutputFilename(file.name, msg.ext, msg.quality);
