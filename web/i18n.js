@@ -23,8 +23,6 @@ export const TRANSLATIONS = {
     dropHint: "أو اسحب الملف وأفلته هنا",
     changeFile: "تغيير الملف",
     startCleaning: "تنقية التلاوة",
-    sampleBtn: "أو جرّب بتلاوة جاهزة (الشيخ البهتيمي)",
-    sampleLoading: "جاري تجهيز التلاوة التجريبية...",
     formatLabel: "صيغة الملف",
     qualityLabel: "الجودة",
     formatOptions: {
@@ -91,7 +89,6 @@ export const TRANSLATIONS = {
       invalidTimestamp: "صيغة الوقت غير صحيحة. استخدم MM:SS أو HH:MM:SS.",
       rangeExceedsDuration: "أحد أوقات البداية يتجاوز مدة الملف الصوتي.",
       noSpeechDetected: "لم يتم العثور على مقاطع صوتية واضحة في هذا الملف.",
-      sampleMissing: "ملف التلاوة التجريبية غير متاح حالياً.",
       ffmpegFailed: "تعذّر فك ترميز أو تصدير الملف الصوتي. تأكد من سلامة الملف.",
     },
   },
@@ -114,8 +111,6 @@ export const TRANSLATIONS = {
     dropHint: "Or drag and drop an audio file here",
     changeFile: "Change file",
     startCleaning: "Clean recitation",
-    sampleBtn: "Or try a sample recitation (Sheikh Al-Bahtimi)",
-    sampleLoading: "Loading sample recitation...",
     formatLabel: "Output format",
     qualityLabel: "Audio quality",
     formatOptions: {
@@ -182,7 +177,6 @@ export const TRANSLATIONS = {
       invalidTimestamp: "Invalid timestamp format. Use MM:SS or HH:MM:SS.",
       rangeExceedsDuration: "A section start timestamp exceeds the audio duration.",
       noSpeechDetected: "No clear speech segments were detected in this audio.",
-      sampleMissing: "The sample recitation file is not available right now.",
       ffmpegFailed: "Could not decode or export this audio file. Please verify the file.",
     },
   },

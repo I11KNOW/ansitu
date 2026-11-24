@@ -316,27 +316,6 @@ textarea {
   align-self: flex-start;
 }
 
-.sample-wrap {
-  text-align: center;
-  margin-top: -0.45rem;
-}
-
-.sample-link {
-  background: transparent;
-  border: none;
-  color: var(--accent);
-  font-size: 0.87rem;
-  font-weight: 600;
-  cursor: pointer;
-  padding: 0.2rem 0.4rem;
-  text-decoration: underline;
-  text-underline-offset: 4px;
-}
-
-.sample-link:hover {
-  color: var(--accent-hover);
-}
-
 .settings-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

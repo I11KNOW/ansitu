@@ -142,6 +142,8 @@ function checkI18nAndHtmlRules() {
   assert.ok(html.includes('id="tab-prayer"'));
   assert.ok(html.includes("تنقية التلاوة"));
   assert.ok(!html.includes('id="trim-toggle"'));
+  assert.ok(!html.includes('id="sample-btn"'), "index.html must not contain #sample-btn");
+  assert.ok(!html.includes('id="sample-wrap"'), "index.html must not contain #sample-wrap");
   assert.ok(html.includes('viewBox="5 7 48 50"'));
   assert.ok(html.includes('dir="ltr"'));
 
@@ -189,7 +191,7 @@ async function checkDevServer() {
       );
     }
 
-    const headMissing = await fetch(`${baseUrl}/assets/sample-bahtimi.mp3`, { method: "HEAD" });
+    const headMissing = await fetch(`${baseUrl}/assets/does-not-exist.mp3`, { method: "HEAD" });
     assert.equal(headMissing.status, 404);
 
     const traversal = await fetch(`${baseUrl}/../app.py`);

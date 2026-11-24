@@ -7,8 +7,6 @@
 import {
   GITHUB_REPO_URL,
   MOBILE_LONG_AUDIO_SECONDS,
-  SAMPLE_AUDIO_FILENAME,
-  SAMPLE_AUDIO_PATH,
   WEB3FORMS_ACCESS_KEY,
   WEB3FORMS_ENDPOINT,
 } from "./config.js";
@@ -74,8 +72,6 @@ const els = {
   selectedFileName: document.getElementById("selected-file-name"),
   selectedFileSize: document.getElementById("selected-file-size"),
   changeFileBtn: document.getElementById("change-file-btn"),
-  sampleWrap: document.getElementById("sample-wrap"),
-  sampleBtn: document.getElementById("sample-btn"),
   formatField: document.getElementById("format-field"),
   formatLabel: document.getElementById("format-label"),
   formatSelect: document.getElementById("format-select"),
@@ -348,7 +344,6 @@ function applyLanguage(lang) {
   els.dropHintLabel.textContent = tr.dropHint;
   els.changeFileBtn.textContent = tr.changeFile;
   els.startBtn.textContent = tr.startCleaning;
-  els.sampleBtn.textContent = tr.sampleBtn;
   els.formatLabel.textContent = tr.formatLabel;
   els.qualityLabel.textContent = tr.qualityLabel;
   els.losslessHint.textContent = tr.losslessHint;
@@ -597,40 +592,6 @@ function resetToInput() {
   showView("input");
 }
 
-async function probeSampleAudio() {
-  try {
-    const res = await fetch(SAMPLE_AUDIO_PATH, { method: "HEAD" });
-    els.sampleWrap.hidden = !res.ok;
-  } catch {
-    els.sampleWrap.hidden = true;
-  }
-}
-
-async function handleSampleClick() {
-  showInputError("");
-  els.sampleBtn.disabled = true;
-  const origLabel = els.sampleBtn.textContent;
-  els.sampleBtn.textContent = t().sampleLoading;
-  try {
-    const res = await fetch(SAMPLE_AUDIO_PATH);
-    if (!res.ok) {
-      throw new Error("MISSING");
-    }
-    const blob = await res.blob();
-    const file = new File([blob], SAMPLE_AUDIO_FILENAME, {
-      type: blob.type || "audio/mpeg",
-    });
-    setSelectedFile(file);
-    await startProcessing(file);
-  } catch {
-    els.sampleWrap.hidden = true;
-    showInputError(t().errors.sampleMissing);
-  } finally {
-    els.sampleBtn.disabled = false;
-    els.sampleBtn.textContent = origLabel;
-  }
-}
-
 async function handleShareClick() {
   const tr = t();
   const shareUrl = window.location.href;
@@ -851,8 +812,6 @@ function bindEvents() {
     }
   });
 
-  els.sampleBtn.addEventListener("click", handleSampleClick);
-
   els.cancelBtn.addEventListener("click", () => {
     cleanupWorkerAndDownloadUrl();
     showView("input");
@@ -871,7 +830,6 @@ function init() {
   bindEvents();
   setupPwaInstall();
   setupFeedbackModal();
-  probeSampleAudio();
 }
 
 init();

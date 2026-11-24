@@ -88,10 +88,6 @@ self.addEventListener("fetch", (event) => {
 
   // Network-first for same-origin app shell (keeps updates fresh while preserving offline support)
   if (url.origin === self.location.origin) {
-    // Do not intercept HEAD probe for optional sample audio
-    if (url.pathname.endsWith("/assets/sample-bahtimi.mp3")) {
-      return;
-    }
     event.respondWith(
       fetch(request)
         .then((response) => {
