@@ -1,0 +1,10 @@
+{
+  "name": "ansitu-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node dev-server.mjs",
+    "test:parity": "node tests/parity.mjs",
+    "test:smoke": "node tests/smoke.mjs"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "أَنصِتُوا",
+  "short_name": "أَنصِتُوا",
+  "description": "أداة مجانية تحذف السكتات الطويلة بين الآيات تلقائياً مع الحفاظ الكامل على كل حرف من التلاوة",
+  "dir": "rtl",
+  "lang": "ar",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f7f8f6",
+  "theme_color": "#15803d",
+  "icons": [
+    {
+      "src": "./icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icons/crescent.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

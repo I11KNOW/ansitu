@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#15803d" />
+  <title>أَنصِتُوا</title>
+  <meta
+    name="description"
+    content="أداة مجانية تحذف السكتات الطويلة بين الآيات تلقائياً مع الحفاظ الكامل على كل حرف من التلاوة"
+  />
+
+  <!-- Open Graph / WhatsApp / LinkedIn Link Card -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="أَنصِتُوا" />
+  <meta
+    property="og:description"
+    content="أداة مجانية تحذف السكتات الطويلة بين الآيات تلقائياً مع الحفاظ الكامل على كل حرف من التلاوة"
+  />
+  <meta property="og:image" content="./assets/og-preview.png" />
+  <meta property="og:locale" content="ar_AR" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="أَنصِتُوا" />
+  <meta
+    name="twitter:description"
+    content="أداة مجانية تحذف السكتات الطويلة بين الآيات تلقائياً مع الحفاظ الكامل على كل حرف من التلاوة"
+  />
+  <meta name="twitter:image" content="./assets/og-preview.png" />
+
+  <!-- PWA & Icons -->
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="./icons/crescent.svg" />
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="أَنصِتُوا">
+        <svg class="brand-logo" viewBox="5 7 48 50" fill="none" aria-hidden="true">
+          <path
+            fill="#16a34a"
+            d="M 50.93 41.54 A 23 23 0 1 1 31.43 9.04 A 19 19 0 0 0 50.93 41.54 Z"
+          />
+        </svg>
+        <span id="brand-name" class="brand-name">أَنصِتُوا</span>
+      </a>
+
+      <div class="topbar-actions">
+        <button
+          id="install-btn"
+          type="button"
+          class="ghost-btn install-btn"
+          hidden
+        >
+          <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3v12m0 0l-4-4m4 4l4-4" />
+            <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+          </svg>
+          <span id="install-btn-label">تثبيت التطبيق</span>
+        </button>
+
+        <button
+          id="lang-toggle"
+          type="button"
+          class="ghost-btn lang-btn"
+          aria-label="Switch to English"
+        >
+          EN
+        </button>
+
+        <button
+          id="theme-toggle"
+          type="button"
+          class="icon-btn"
+          aria-label="تفعيل الوضع الداكن"
+        >
+          <svg id="theme-icon-moon" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+          </svg>
+          <svg id="theme-icon-sun" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+            <circle cx="12" cy="12" r="4" />
+            <path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41" />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- iOS Safari Add-to-Home-Screen popover -->
+    <div id="ios-install-popover" class="ios-popover" role="status" hidden>
+      <div class="ios-popover-text">
+        <p id="ios-line-1">اضغط على زر المشاركة بالأسفل</p>
+        <p id="ios-line-2">ثم اختر «إضافة إلى الشاشة الرئيسية»</p>
+      </div>
+      <button id="ios-popover-close" type="button" class="close-x" aria-label="إغلاق">&times;</button>
+    </div>
+
+    <main class="main-card">
+      <!-- 1. INPUT VIEW -->
+      <section id="view-input" class="view-panel" aria-live="polite">
+        <div class="hero">
+          <h1 id="hero-title" class="hero-title">تلاوات خاشعة، بلا سكتات طويلة</h1>
+          <p id="hero-subtitle" class="hero-subtitle">
+            احذف السكتات الطويلة بين الآيات تلقائياً، مع الحفاظ على كل حرف من التلاوة
+          </p>
+        </div>
+
+        <div class="mode-tabs" role="tablist" aria-label="نوع التلاوة">
+          <button
+            id="tab-standard"
+            type="button"
+            role="tab"
+            class="mode-tab is-active"
+            aria-selected="true"
+            aria-controls="view-input"
+          >
+            تلاوة عادية
+          </button>
+          <button
+            id="tab-prayer"
+            type="button"
+            role="tab"
+            class="mode-tab"
+            aria-selected="false"
+            aria-controls="trim-panel"
+          >
+            تلاوة صلاة
+          </button>
+        </div>
+
+        <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-labelledby="pick-file-label">
+          <input
+            id="file-input"
+            type="file"
+            accept=".mp3,.wav,.m4a,.mp4,.mkv,.webm,.opus,.flac,.ogg,audio/*"
+            hidden
+          />
+          <div class="dropzone-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="4" y1="10" x2="4" y2="14" />
+              <line x1="8" y1="7" x2="8" y2="17" />
+              <line x1="12" y1="4" x2="12" y2="20" />
+              <line x1="16" y1="7" x2="16" y2="17" />
+              <line x1="20" y1="10" x2="20" y2="14" />
+            </svg>
+          </div>
+          <span id="pick-file-label" class="dropzone-cta">اختر ملفاً صوتياً</span>
+          <span id="drop-hint-label" class="dropzone-hint">
+            أو اسحب الملف وأفلته هنا
+          </span>
+        </div>
+
+        <div id="selected-file-bar" class="selected-file-bar" hidden>
+          <div class="selected-file-meta">
+            <span id="selected-file-name" class="selected-file-name"></span>
+            <span id="selected-file-size" class="selected-file-size" dir="ltr"></span>
+          </div>
+          <button id="change-file-btn" type="button" class="link-btn">تغيير الملف</button>
+        </div>
+
+        <div class="sample-wrap" id="sample-wrap" hidden>
+          <button id="sample-btn" type="button" class="sample-link">
+            أو جرّب بتلاوة جاهزة (الشيخ البهتيمي)
+          </button>
+        </div>
+
+        <div id="trim-panel" class="trim-panel" role="tabpanel" aria-labelledby="tab-prayer" hidden>
+          <p id="trim-hint" class="trim-hint">
+            حدد أوقات البداية والنهاية (مثال: 01:20) لاستبعاد الركوع والسجود أو استخراج مقطع محدد
+          </p>
+          <div id="ranges-list" class="ranges-list"></div>
+          <button id="add-range-btn" type="button" class="secondary-sm-btn">
+            + <span id="add-range-label">إضافة جزء آخر</span>
+          </button>
+        </div>
+
+        <div class="settings-grid">
+          <div class="field" id="format-field">
+            <label id="format-label" for="format-select">صيغة الملف</label>
+            <select id="format-select" class="select-control"></select>
+          </div>
+
+          <div class="field">
+            <label id="quality-label" for="quality-select">الجودة</label>
+            <select id="quality-select" class="select-control"></select>
+          </div>
+        </div>
+        <p id="lossless-hint" class="micro-note" hidden>
+          سيتم التصدير بصيغة WAV غير مضغوطة مع الحفاظ على كامل الجودة الأصلية.
+        </p>
+
+        <p id="input-error" class="inline-error" role="alert" hidden></p>
+
+        <button id="start-btn" type="button" class="primary-btn" disabled>
+          تنقية التلاوة
+        </button>
+      </section>
+
+      <!-- 2. PROCESSING VIEW -->
+      <section id="view-processing" class="view-panel view-centered" hidden aria-live="polite">
+        <div class="processing-emblem" aria-hidden="true">
+          <svg class="crescent-pulse" viewBox="5 7 48 50" fill="none">
+            <path
+              fill="#16a34a"
+              d="M 50.93 41.54 A 23 23 0 1 1 31.43 9.04 A 19 19 0 0 0 50.93 41.54 Z"
+            />
+          </svg>
+        </div>
+
+        <p id="processing-filename" class="processing-filename"></p>
+        <p id="processing-stage" class="processing-stage">جاري تجهيز محرك الصوت...</p>
+
+        <div class="progress-wrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar-wrap">
+          <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="progress-pct" class="progress-pct">0%</p>
+
+        <p id="mobile-long-tip" class="soft-tip" hidden>
+          نصيحة: التلاوات الطويلة (أكثر من 45 دقيقة) تُعالج بسرعة أكبر على الحاسوب.
+        </p>
+
+        <button id="cancel-btn" type="button" class="secondary-btn">إلغاء</button>
+      </section>
+
+      <!-- 3. RESULT VIEW (Strictly NO audio preview player and NO segments count) -->
+      <section id="view-result" class="view-panel view-centered" hidden aria-live="polite">
+        <div class="status-badge status-success" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        </div>
+
+        <h2 id="result-title" class="panel-heading">تمت تنقية التلاوة</h2>
+        <p id="result-summary" class="result-summary"></p>
+
+        <div class="result-actions">
+          <a id="download-btn" class="primary-btn download-link" download>
+            تحميل التلاوة
+          </a>
+          <button id="share-btn" type="button" class="secondary-btn">
+            مشاركة الأداة
+          </button>
+        </div>
+
+        <button id="another-btn" type="button" class="link-btn another-btn">
+          معالجة ملف آخر
+        </button>
+      </section>
+
+      <!-- 4. LOW-SNR SAFETY GUARD VIEW -->
+      <section id="view-low-snr" class="view-panel view-centered" hidden aria-live="polite">
+        <div class="status-badge status-guard" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+          </svg>
+        </div>
+
+        <h2 id="low-snr-title" class="panel-heading">تعذّر القص التلقائي لحماية التلاوة</h2>
+        <p id="low-snr-body" class="guard-body">
+          يحتوي هذا التسجيل على ضوضاء خلفية مرتفعة، ولذلك أوقفنا قصّ السكتات تلقائياً تعظيماً للقرآن الكريم وحفاظاً على كل حرف من التلاوة دون أي اقتطاع.
+        </p>
+
+        <button id="guard-another-btn" type="button" class="primary-btn">
+          اختيار ملف آخر
+        </button>
+      </section>
+    </main>
+
+    <footer class="footer-line">
+      <button id="feedback-open-btn" type="button" class="footer-link">
+        ملاحظات
+      </button>
+      <span class="footer-dot" aria-hidden="true">·</span>
+      <a
+        id="github-link"
+        class="footer-link"
+        href="https://github.com/I11KNOW/ansitu"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        GitHub
+      </a>
+    </footer>
+  </div>
+
+  <!-- Feedback / Report Issue Modal -->
+  <dialog id="feedback-dialog" class="modal-dialog" aria-labelledby="feedback-dialog-title">
+    <form id="feedback-form" class="modal-card">
+      <div class="modal-header">
+        <h3 id="feedback-dialog-title">ملاحظات أو الإبلاغ عن مشكلة</h3>
+        <button id="feedback-close-x" type="button" class="close-x" aria-label="إغلاق">&times;</button>
+      </div>
+
+      <div class="field">
+        <label id="feedback-msg-label" for="feedback-message">الرسالة</label>
+        <textarea
+          id="feedback-message"
+          name="message"
+          rows="4"
+          required
+          placeholder="اكتب ملاحظتك أو صف المشكلة التي واجهتك..."
+        ></textarea>
+      </div>
+
+      <div class="field">
+        <label id="feedback-reciter-label" for="feedback-reciter">القارئ أو السورة (اختياري)</label>
+        <input
+          id="feedback-reciter"
+          name="reciter"
+          type="text"
+          placeholder="مثال: الشيخ البهتيمي - سورة طه"
+        />
+      </div>
+
+      <p id="feedback-status" class="feedback-status" hidden></p>
+
+      <div class="modal-actions">
+        <button id="feedback-submit-btn" type="submit" class="primary-btn">إرسال</button>
+        <button id="feedback-cancel-btn" type="button" class="secondary-btn">إغلاق</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
