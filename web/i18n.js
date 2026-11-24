@@ -44,9 +44,9 @@ export const TRANSLATIONS = {
     rangeActionRemove: "حذف هذه المقاطع",
     rangeActionKeep: "الاحتفاظ بهذه المقاطع فقط",
     trimHintRemove:
-      "أدخل أوقات المقاطع التي تريد حذفها (مثل الفاتحة والركوع والسجود) وسيتم الاحتفاظ بباقي التلاوة",
+      "أدخل أوقات المقاطع التي تريد حذفها (مثل الفاتحة والركوع والسجود). لأمان كامل، يُفضّل ترك ثانية قبل بداية الآية.",
     trimHintKeep:
-      "أدخل أوقات المقاطع التي تريد الاحتفاظ بها فقط وسيتم دمجها معاً",
+      "أدخل أوقات المقاطع التي تريد الاحتفاظ بها فقط وسيتم دمجها معاً. لأمان كامل، يُفضّل ترك ثانية قبل بداية الآية.",
     startTime: "البداية",
     endTime: "النهاية",
     rangeNumber: (n) => `الجزء ${n}`,
@@ -141,9 +141,9 @@ export const TRANSLATIONS = {
     rangeActionRemove: "Remove these ranges",
     rangeActionKeep: "Keep only these ranges",
     trimHintRemove:
-      "Enter timestamps to remove (e.g., Al-Fatihah, Ruku', Sujud) and keep the rest of the recitation",
+      "Enter timestamps to remove (e.g., Al-Fatihah, Ruku', Sujud). For safety, leave ~1 second before each verse starts.",
     trimHintKeep:
-      "Enter timestamps to keep only those passages and join them together",
+      "Enter timestamps to keep only those passages and join them together. For safety, leave ~1 second before each verse starts.",
     startTime: "Start",
     endTime: "End",
     rangeNumber: (n) => `Section ${n}`,

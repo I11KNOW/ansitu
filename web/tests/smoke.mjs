@@ -174,6 +174,10 @@ function checkI18nAndHtmlRules() {
   assert.ok(en.resultSilenceSkippedNotice.length > 20);
   assert.ok(ar.resultSilencePartialNotice.length > 20);
   assert.ok(en.resultSilencePartialNotice.length > 20);
+  assert.ok(ar.trimHintRemove.includes("ثانية"), "AR remove hint must include ~1s margin tip");
+  assert.ok(ar.trimHintKeep.includes("ثانية"), "AR keep hint must include ~1s margin tip");
+  assert.ok(en.trimHintRemove.includes("1 second"), "EN remove hint must include ~1s margin tip");
+  assert.ok(en.trimHintKeep.includes("1 second"), "EN keep hint must include ~1s margin tip");
   assert.ok(ar.errors.allAudioRemoved.length > 10);
   assert.ok(en.errors.allAudioRemoved.length > 10);
   assert.ok(html.includes("تنقية التلاوة"));
@@ -311,7 +315,7 @@ function checkPrayerModeLogic() {
   assert.deepEqual(prayerDecision.rangeResults[1].segments, [
     { start: 120, end: 300, duration: 180 },
   ]);
-  assert.equal(prayerDecision.rangeResults[0].resolved_crossfade_ms, 80);
+  assert.equal(prayerDecision.rangeResults[0].resolved_crossfade_ms, 0);
 
   // 8. Prayer Mode partial skip (1 noisy range + 1 clean trimmed range) must NOT set silenceTrimSkipped=true
   const partialDecision = applyPrayerModeFallback(
@@ -425,6 +429,76 @@ function checkPrayerModeLogic() {
   assert.equal(cleanDecision.action, "splice");
   assert.equal(cleanDecision.silenceTrimSkipped, false);
   assert.equal(cleanDecision.silenceTrimStatus, "trimmed");
+  // Tight edge within 1.2s of user boundary is snapped to preserve initial/final consonants
+  assert.equal(cleanDecision.rangeResults[0].segments[0].start, 0);
+  assert.equal(cleanDecision.rangeResults[0].segments[0].end, 60);
+
+  // 12. Long silence (>1.2s) at start of a Prayer Mode range is still trimmed by VAD
+  const longLeadSilenceDecision = applyPrayerModeFallback(
+    [
+      {
+        segments: [{ start: 105.0, end: 155.0, duration: 50.0 }],
+        total_duration: 60,
+        low_snr_guarded: false,
+        resolved_crossfade_ms: 150,
+        resolved_gap_ms: 0,
+      },
+    ],
+    [{ startS: 100.0, endS: 160.0 }],
+    { isPrayerMode: true, hasUserRanges: true }
+  );
+  assert.equal(longLeadSilenceDecision.rangeResults[0].segments[0].start, 105.0);
+  assert.equal(longLeadSilenceDecision.rangeResults[0].segments[0].end, 155.0);
+
+  // 13. Non-overlapping Prayer Mode join preserves exact start of incoming clip
+  //     (12 ms de-click micro-fade + 400 ms pause, ZERO 80 ms crossfade overlap)
+  const joinSr = 8000;
+  const joinPcm = new Int16Array(joinSr * 8);
+  // Range 1 [0s..2s]: constant +12000; Excluded [2s..5s]: -25000 (must NEVER bleed in!);
+  // Range 2 [5s..7s]: constant +20000 starting right at sample 0 of t=5.000s (tight consonant onset)
+  for (let i = 0; i < joinSr * 2; i++) joinPcm[i] = 12000;
+  for (let i = joinSr * 2; i < joinSr * 5; i++) joinPcm[i] = -25000;
+  for (let i = joinSr * 5; i < joinSr * 7; i++) joinPcm[i] = 20000;
+
+  const joined = spliceRangesInt16({
+    pcm: joinPcm,
+    sampleRate: joinSr,
+    channels: 1,
+    fadeEdges: false,
+    rangeResults: [
+      {
+        segments: [{ start: 0.0, end: 2.0, duration: 2.0 }],
+        resolved_crossfade_ms: 150,
+        resolved_gap_ms: 0,
+        use_room_tone: false,
+        low_snr_guarded: false,
+      },
+      {
+        segments: [{ start: 5.0, end: 7.0, duration: 2.0 }],
+        resolved_crossfade_ms: 150,
+        resolved_gap_ms: 0,
+        use_room_tone: false,
+        low_snr_guarded: false,
+      },
+    ],
+  });
+
+  // Exact non-overlapping duration: 2.0s + 0.400s pause + 2.0s = 4.400s
+  assert.ok(
+    Math.abs(joined.duration - 4.4) < 0.002,
+    `Expected non-overlapping 4.400s duration, got ${joined.duration}`
+  );
+  // Excluded region (-25000) must never bleed past Range 1's end (no tail extension!)
+  for (let i = 0; i < joined.pcm.length; i++) {
+    assert.ok(joined.pcm[i] >= 0, `Excluded audio leaked into output at sample ${i}: ${joined.pcm[i]}`);
+  }
+  // Mid-pause (t = 2.200s) is quiet (0 for studio silence)
+  assert.equal(joined.pcm[Math.round(2.2 * joinSr)], 0);
+  // Incoming Range 2 starts at t = 2.400s: sample 0 is de-clicked (0), and by 15 ms (t = 2.415s)
+  // it is ALREADY at 100% untouched full amplitude (+20000), proving zero 80-150ms consonant clipping!
+  const range2Start = Math.round(2.4 * joinSr);
+  assert.equal(joined.pcm[range2Start], 0);
+  assert.equal(joined.pcm[range2Start + Math.round(0.015 * joinSr)], 20000);
 }
 
 async function checkDevServer() {

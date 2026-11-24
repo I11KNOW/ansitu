@@ -21,6 +21,9 @@ import {
   detectSpeechSegments,
 } from "./engine/vad.js";
 import {
+  EDGE_FADE_IN_MS,
+  EDGE_FADE_OUT_MS,
+  INTER_RANGE_MICRO_FADE_MS,
   MIME_TYPES,
   QUALITY_PRESETS,
   applyPrayerModeFallback,
@@ -448,11 +451,18 @@ self.onmessage = async (event) => {
     const silenceTrimStatus = decision.silenceTrimStatus;
 
     postProgress("splicing", 66);
+    const trimmedStart = isPrayerMode && hasUserRanges && effectiveRanges[0].startS > 0.05;
+    const trimmedEnd =
+      isPrayerMode &&
+      hasUserRanges &&
+      effectiveRanges[effectiveRanges.length - 1].endS < totalDuration - 0.05;
     let spliced = spliceRangesInt16({
       pcm: nativePcm,
       sampleRate,
       channels,
       rangeResults: decision.rangeResults,
+      edgeFadeInMs: trimmedStart ? INTER_RANGE_MICRO_FADE_MS : EDGE_FADE_IN_MS,
+      edgeFadeOutMs: trimmedEnd ? INTER_RANGE_MICRO_FADE_MS : EDGE_FADE_OUT_MS,
     });
     // Aggressively release large native PCM buffer before creating output WAV
     nativePcm = null;
